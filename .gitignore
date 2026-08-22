@@ -1,0 +1,36 @@
+# 環境
+.venv/
+__pycache__/
+*.pyc
+
+# モデル・埋め込み（巨大、git 管理しない。フォルダだけ残す）
+models/checkpoints/*
+models/embeddings/*
+!models/checkpoints/.keep
+!models/embeddings/.keep
+
+# 生成結果
+outputs/*
+!outputs/.keep
+
+# Gradio / キャッシュ
+.gradio/
+flagged/
+*.log
+.hf_cache/
+
+# 個人設定・秘密情報（Civitai API キーなどを置く場合）
+.env
+config.local.json
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 拡張子違いのモデルも念のため除外
+*.ckpt
+*.pt
+*.bin

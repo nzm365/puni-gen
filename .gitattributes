@@ -1,0 +1,4 @@
+# 改行コード：Windows 用スクリプトは CRLF、それ以外は LF に正規化
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,0 +1,9 @@
+{
+  "steps": 28,
+  "cfg": 5.0,
+  "sampler": "euler_a",
+  "clip_skip": 2,
+  "size": [832, 1216],
+  "prefix_pos": "masterpiece, best quality, ",
+  "default_neg": "worst quality, low quality, bad anatomy, watermark"
+}
