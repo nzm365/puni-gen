@@ -138,7 +138,8 @@ class Engine:
                 # Tensor Core が効きやすいメモリ配置（オフロード時は転送が支配的なので省略）
                 pipe.unet.to(memory_format=torch.channels_last)
                 pipe.vae.to(memory_format=torch.channels_last)
-        pipe.enable_vae_tiling()  # 高解像度でも VAE でメモリを食い潰さない
+        # 高解像度でも VAE でメモリを食い潰さない（i2i パイプとは VAE を共有しているので一度でよい）
+        pipe.vae.enable_tiling()
         self.current = ckpt_name
         return (
             f"loaded: {ckpt_name}  ({mode})  "
