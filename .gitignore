@@ -18,6 +18,10 @@ outputs/*
 flagged/
 *.log
 .hf_cache/
+.thumb_cache/
+
+# ダウンロード中の一時ファイル
+*.part
 
 # 個人設定・秘密情報（Civitai API キーなどを置く場合）
 .env
