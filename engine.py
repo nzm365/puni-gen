@@ -1,7 +1,9 @@
 """diffusers ベースの SDXL/Illustrious 推論エンジン。ComfyUI 非依存。"""
 from __future__ import annotations
 
+import gc
 import json
+import threading
 from pathlib import Path
 
 import torch
@@ -28,9 +30,11 @@ ACTIVATION_HEADROOM_GB = 2.5
 LOW_VRAM_GB = 10
 
 # 速度優先の数値設定（cuDNN autotune / TF32 / channels_last / QKV 融合）。
-# 見た目の品質は変わらないが、ビット単位では結果が変わりうる。
-# 同じ seed で完全に同じピクセルを再現したいときは False にする。
-SPEED_TWEAKS = True
+# 注意: VRAM ギリギリの環境では逆効果。QKV 融合で重みが約 1.2GB 増え、
+# ピークが VRAM を超えると Windows が共有メモリに退避させて激遅になる。
+# RTX 5070 (12GB) + SDXL で 0.92秒/step → 51秒/step の悪化を実測 (2026-08-23)。
+# VRAM 16GB 以上で余裕があるときだけ True を試す価値がある。
+SPEED_TWEAKS = False
 
 # 単一ファイル形式のチェックポイントで UNet が持つキーの接頭辞。
 # オフロード時は「一番大きい単体モジュール = UNet」が VRAM ピークになる。
@@ -105,6 +109,9 @@ class Engine:
         self.pipe_i2i: StableDiffusionXLImg2ImgPipeline | None = None
         self.current: str | None = None
         self.loaded_embeddings: list[str] = []
+        # ロードと生成の直列化。Gradio の demo.load はブラウザのタブごとに発火するため、
+        # タブが複数あると同じモデルのロードが同時に走り、GPU に 2 個分載って溢れる。
+        self._lock = threading.Lock()
         if SPEED_TWEAKS and torch.cuda.is_available():
             # 解像度が数種類に固定される使い方では cuDNN の autotune が効く
             # （新しい解像度の最初の 1 回だけ、カーネル探索の分わずかに遅い）
@@ -115,6 +122,10 @@ class Engine:
 
     # ---------- モデル ----------
     def load(self, ckpt_name: str) -> str:
+        with self._lock:
+            return self._load_impl(ckpt_name)
+
+    def _load_impl(self, ckpt_name: str) -> str:
         if self.current == ckpt_name and self.pipe is not None:
             return f"already loaded: {ckpt_name}"
         self.unload()
@@ -128,8 +139,11 @@ class Engine:
         if SPEED_TWEAKS:
             pipe.fuse_qkv_projections()  # attention の Q/K/V を 1 つの行列積に融合
         # i2i パイプは t2i と全コンポーネントを共有する（重みのコピーは発生しない）。
-        # オフロードのフックが付く前に作っておく
-        self.pipe_i2i = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe)
+        # オフロードのフックが付く前に作っておく。
+        # torch_dtype は必ず明示する。diffusers 0.40 の from_pipe は dtype 未指定だと
+        # 共有コンポーネントごと fp32 へキャストするため、重みが倍の 13GB になり
+        # VRAM から溢れて生成が数十倍遅くなる（実測済み）。
+        self.pipe_i2i = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe, torch_dtype=torch.float16)
         if offload:
             pipe.enable_model_cpu_offload()
         else:
@@ -156,23 +170,28 @@ class Engine:
             raise InsufficientVram(
                 "CUDA が使える GPU が見つかりません。setup.bat を実行し直してください。"
             )
-        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        # 総容量ではなく「今の空き」で判定する。他のアプリ (ゲーム・録画・dwm) が
+        # VRAM を掴んでいると、総容量では載る計算でも実際には共有メモリに溢れて
+        # 生成が数十倍遅くなる（進捗バーが 0 のまま動かないように見える）。
+        vram = torch.cuda.mem_get_info()[0] / 1024**3
         size = fp16_footprint(path)
         if size is None:
             # 見積れない形式。弾かずに載せてみるが、VRAM が小さいなら安全側 (オフロード) に倒す
             offload = vram < LOW_VRAM_GB
-            return offload, f"VRAM {vram:.0f}GB: {'cpu offload (低速)' if offload else 'gpu'}"
+            return offload, f"空き VRAM {vram:.1f}GB: {'cpu offload (低速)' if offload else 'gpu'}"
         total, unet = size
         if vram >= total + ACTIVATION_HEADROOM_GB:
-            return False, f"VRAM {vram:.0f}GB / 重み {total:.1f}GB: gpu"
+            return False, f"空き VRAM {vram:.1f}GB / 重み {total:.1f}GB: gpu"
         if vram >= unet + ACTIVATION_HEADROOM_GB:
-            return True, f"VRAM {vram:.0f}GB / 重み {total:.1f}GB: cpu offload (低速)"
+            return True, f"空き VRAM {vram:.1f}GB / 重み {total:.1f}GB: cpu offload (低速)"
         raise InsufficientVram(
-            f"VRAM が足りないため {path.name} は読み込めません。\n"
+            f"空き VRAM が足りないため {path.name} は読み込めません。\n"
             f"このモデルは fp16 でも重みが約 {total:.1f}GB、"
             f"オフロードしても最大 {unet:.1f}GB + 作業領域 {ACTIVATION_HEADROOM_GB}GB を"
-            f"同時に必要としますが、この GPU の VRAM は {vram:.1f}GB です。\n"
-            f"より小さいモデルを使うか、engine.py の ACTIVATION_HEADROOM_GB を下げてください。"
+            f"同時に必要としますが、現在の空き VRAM は {vram:.1f}GB です。\n"
+            f"VRAM を使う他のアプリ (ゲーム・配信/録画ソフト・ブラウザ) を閉じてから"
+            f"やり直してください。それでも足りなければ、より小さいモデルを使うか、"
+            f"engine.py の ACTIVATION_HEADROOM_GB を下げてください。"
         )
 
     def unload(self):
@@ -182,6 +201,7 @@ class Engine:
             self.pipe_i2i = None  # 共有コンポーネントなので参照を消すだけでよい
             self.current = None
             self.loaded_embeddings = []
+            gc.collect()  # パイプラインは循環参照を持つので、明示的に回収してから
             torch.cuda.empty_cache()
 
     # ---------- Embedding (SDXL 形式: clip_l / clip_g) ----------
@@ -215,8 +235,13 @@ class Engine:
         if self.pipe_i2i is not None:  # scheduler の差し替えは両パイプに反映する
             self.pipe_i2i.scheduler = sched
 
+    def generate(self, *args, **kwargs):
+        # 生成も直列化する。二重クリック等で 2 つ同時に走ると作業メモリが倍増して溢れる
+        with self._lock:
+            return self._generate_impl(*args, **kwargs)
+
     @torch.inference_mode()
-    def generate(
+    def _generate_impl(
         self,
         prompt: str,
         negative: str,
