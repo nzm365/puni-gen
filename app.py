@@ -5,9 +5,11 @@ from pathlib import Path
 import gradio as gr
 
 import civitai
+import prompt_autocomplete
 from engine import Engine, InsufficientVram, SAMPLERS, fit_size, list_checkpoints, load_preset
 
 OUT_DIR = Path(__file__).parent / "outputs"
+EMB_DIR = Path(__file__).parent / "models" / "embeddings"
 engine = Engine()
 
 ASPECTS = {
@@ -108,6 +110,7 @@ def on_download(cands, idx, progress=gr.Progress()):
     return msg, gr.update(choices=list_checkpoints())
 
 
+emb_tokens = sorted(p.stem for p in EMB_DIR.glob("*.safetensors"))
 with gr.Blocks(title="RTX Easy Image Gen") as demo:
     ckpts = list_checkpoints()
     gr.Markdown("## RTX Easy Image Gen")
@@ -124,8 +127,10 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                 status = gr.Markdown("")
 
                 prefix = gr.Textbox(label="プレフィックス（プリセットから自動）", lines=1)
-                prompt = gr.Textbox(label="プロンプト", lines=4, placeholder="1girl, ...")
-                negative = gr.Textbox(label="ネガティブ", lines=2)
+                prompt = gr.Textbox(
+                    label="プロンプト", lines=4, placeholder="1girl, ...", elem_id="prompt_box"
+                )
+                negative = gr.Textbox(label="ネガティブ", lines=2, elem_id="neg_box")
 
                 with gr.Row():
                     aspect = gr.Radio(list(ASPECTS), value="縦 (プリセット)", label="サイズ")
@@ -210,4 +215,4 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
     if ckpts:
         demo.load(on_model_change, model_dd, preset_outputs)
 
-demo.launch(inbrowser=True)
+demo.launch(inbrowser=True, head=prompt_autocomplete.build_head(emb_tokens))
