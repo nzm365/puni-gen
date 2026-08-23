@@ -68,39 +68,46 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
 with gr.Blocks(title="RTX Easy Image Gen") as demo:
     ckpts = list_checkpoints()
     gr.Markdown("## RTX Easy Image Gen")
-    with gr.Row():
-        model_dd = gr.Dropdown(ckpts, value=ckpts[0] if ckpts else None, label="モデル", scale=4)
-        refresh = gr.Button("↻", scale=0)
-    status = gr.Markdown("")
 
-    prefix = gr.Textbox(label="プレフィックス（プリセットから自動）", lines=1)
-    prompt = gr.Textbox(label="プロンプト", lines=4, placeholder="1girl, ...")
-    negative = gr.Textbox(label="ネガティブ", lines=2)
+    # 左に操作系、右に生成結果。縦に伸ばさず 1 画面に収める
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=1):
+            with gr.Row():
+                model_dd = gr.Dropdown(
+                    ckpts, value=ckpts[0] if ckpts else None, label="モデル", scale=4
+                )
+                refresh = gr.Button("↻", scale=0)
+            status = gr.Markdown("")
 
-    with gr.Accordion("img2img（画像を置くと、その画像を下敷きに生成）", open=False):
-        with gr.Row():
-            in_image = gr.Image(type="pil", label="入力画像（空なら通常の txt2img）", height=280)
-            strength = gr.Slider(
-                0.1, 1.0, 0.6, step=0.05,
-                label="変化の強さ（低いほど元画像に忠実、1.0 でほぼ無視）",
-            )
+            prefix = gr.Textbox(label="プレフィックス（プリセットから自動）", lines=1)
+            prompt = gr.Textbox(label="プロンプト", lines=4, placeholder="1girl, ...")
+            negative = gr.Textbox(label="ネガティブ", lines=2)
 
-    with gr.Row():
-        aspect = gr.Radio(list(ASPECTS), value="縦 (プリセット)", label="サイズ")
-        n = gr.Slider(1, 4, 1, step=1, label="枚数")
+            with gr.Row():
+                aspect = gr.Radio(list(ASPECTS), value="縦 (プリセット)", label="サイズ")
+                n = gr.Slider(1, 4, 1, step=1, label="枚数")
 
-    with gr.Accordion("詳細設定", open=False):
-        with gr.Row():
-            steps = gr.Slider(10, 50, 28, step=1, label="Steps")
-            cfg = gr.Slider(1, 10, 5, step=0.5, label="CFG")
-        with gr.Row():
-            sampler = gr.Dropdown(list(SAMPLERS), value="euler_a", label="Sampler")
-            clip_skip = gr.Slider(1, 3, 2, step=1, label="Clip Skip")
-            seed = gr.Number(-1, label="Seed (-1 でランダム)", precision=0)
+            go = gr.Button("生成", variant="primary")
 
-    go = gr.Button("生成", variant="primary")
-    gallery = gr.Gallery(label="結果", columns=2, height="auto")
-    info = gr.Textbox(label="生成情報", interactive=False)
+            with gr.Accordion("img2img（画像を置くと、その画像を下敷きに生成）", open=False):
+                in_image = gr.Image(type="pil", label="入力画像（空なら通常の txt2img）", height=280)
+                strength = gr.Slider(
+                    0.1, 1.0, 0.6, step=0.05,
+                    label="変化の強さ（低いほど元画像に忠実、1.0 でほぼ無視）",
+                )
+
+            with gr.Accordion("詳細設定", open=False):
+                with gr.Row():
+                    steps = gr.Slider(10, 50, 28, step=1, label="Steps")
+                    cfg = gr.Slider(1, 10, 5, step=0.5, label="CFG")
+                with gr.Row():
+                    sampler = gr.Dropdown(list(SAMPLERS), value="euler_a", label="Sampler")
+                    clip_skip = gr.Slider(1, 3, 2, step=1, label="Clip Skip")
+                    seed = gr.Number(-1, label="Seed (-1 でランダム)", precision=0)
+
+        with gr.Column(scale=1):
+            gallery = gr.Gallery(label="結果", columns=2, height=760)
+            info = gr.Textbox(label="生成情報", interactive=False, lines=2)
 
     preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
     model_dd.change(on_model_change, model_dd, preset_outputs)
