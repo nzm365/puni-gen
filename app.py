@@ -288,4 +288,11 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
     if ckpts:
         demo.load(on_model_change, model_dd, preset_outputs)
 
-demo.launch(inbrowser=True, head=prompt_autocomplete.build_head(emb_tokens))
+demo.launch(
+    inbrowser=True,
+    head=prompt_autocomplete.build_head(emb_tokens),
+    # Gradio は自分が作ったファイル以外の配信を 403 で拒む。検索結果のサムネイルは
+    # civitai.py が .thumb_cache に自前で保存しているため、明示的に許可しないと
+    # ギャラリーが空のまま表示される
+    allowed_paths=[str(civitai.THUMB_DIR)],
+)

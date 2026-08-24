@@ -21,6 +21,9 @@ uv venv --python 3.12 .venv
 echo [4/4] 依存パッケージをインストール（torch は CUDA 12.8 ビルド / RTX 40・50 系対応）...
 uv pip install --python .venv torch torchvision --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python .venv -r requirements.txt
+rem compel は notebook (Jupyter 一式) を依存に宣言しているが実行時には使わないため、
+rem --no-deps で本体だけ入れる（必要な pyparsing は requirements.txt 側で導入済み）
+uv pip install --python .venv --no-deps compel
 
 echo.
 echo セットアップ完了。GPU 認識を確認します:

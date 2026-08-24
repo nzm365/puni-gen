@@ -144,6 +144,8 @@ class Engine:
         # (モデル, プロンプト, ネガティブ, clip_skip) → encode_prompt の結果。
         # seed だけ変えて連打する使い方ではテキストエンコーダ 2 基を毎回回す必要がない
         self._embed_cache: OrderedDict[tuple, tuple] = OrderedDict()
+        # 重み付き構文と長いプロンプトの解釈器 (CompelForSDXL)。初回使用時に作る
+        self._compel = None
         # fp16 デコードで NaN/Inf を出した実績のあるモデル名 (以後そのモデルは fp32 でデコード)。
         # ディスクに永続化し、次回起動では fp16 で探り直さない（無駄な二重デコードを防ぐ）
         self._vae_fp32: set[str] = set()
@@ -256,6 +258,7 @@ class Engine:
             self.current = None
             self.loaded_embeddings = []
             self._embed_cache.clear()  # GPU 上のテンソルを持っているので必ず捨てる
+            self._compel = None  # 前のモデルのテキストエンコーダを掴んだままにしない
             gc.collect()  # パイプラインは循環参照を持つので、明示的に回収してから
             torch.cuda.empty_cache()
 
@@ -310,6 +313,17 @@ class Engine:
                 print(f"[warn] embedding {f.name} の読み込みに失敗: {e}")
 
     # ---------- プロンプト埋め込み ----------
+    # UI の Clip Skip (A1111/Civitai と同じ意味) → diffusers の clip_skip 引数。
+    #
+    # diffusers の SDXL は hidden_states[-(clip_skip + 2)] を取る。つまり clip_skip=None/0 で
+    # 既に penultimate = A1111 でいう Clip Skip 2 の層になっている ("SDXL always indexes
+    # from the penultimate layer" とソースにある)。したがって差は 2。
+    # 旧実装は「diffusers は飛ばす層数を受ける」と誤解して -1 していたため、
+    # UI で 2 を選んでも実際には A1111 の Clip Skip 3 相当の層が使われ、
+    # Civitai のサンプルと絵柄が一致しなかった (2026-08-24 に実測で確認)。
+    #
+    #   UI 1 → -1 → hidden_states[-1]   UI 2 → 0 → hidden_states[-2]   UI 3 → 1 → [-3]
+
     def _get_embeds(self, prompt: str, negative: str, clip_skip: int):
         """encode_prompt の結果を LRU キャッシュ。seed 連打時はテキストエンコードが 0 秒になる。
 
@@ -321,19 +335,46 @@ class Engine:
         if hit is not None:
             self._embed_cache.move_to_end(key)
             return hit
-        out = self.pipe.encode_prompt(
+        out = self._encode_compel(prompt, negative, clip_skip)
+        if out is None:  # compel が使えない構成 → 素の encode_prompt に落とす
+            out = self._encode_plain(prompt, negative, clip_skip)
+        self._embed_cache[key] = out
+        while len(self._embed_cache) > 8:  # 1 件 ~1.3MB (VRAM)。8 件で十分
+            self._embed_cache.popitem(last=False)
+        return out
+
+    def _encode_compel(self, prompt: str, negative: str, clip_skip: int):
+        """A1111 互換の重み付き構文 `(tag:1.2)` と 77 トークン超のプロンプトを通す。
+
+        CompelForSDXL は penultimate 非正規化 = UI の Clip Skip 2 に固定なので、
+        それ以外が選ばれたときは素の encode_prompt に任せる（None を返す）。
+        失敗時も None を返し、生成そのものは必ず続行させる。
+        """
+        if clip_skip != 2:
+            return None
+        try:
+            c = self._compel
+            if c is None:
+                from compel import CompelForSDXL
+
+                c = CompelForSDXL(self.pipe, device=self.pipe._execution_device)
+                self._compel = c
+            r = c(prompt, negative_prompt=negative or "")
+            return r.embeds, r.negative_embeds, r.pooled_embeds, r.negative_pooled_embeds
+        except Exception as e:  # noqa: BLE001 — 構文エラー等で生成を殺さない
+            print(f"[prompt] compel が使えないため通常解釈にフォールバック: {e}")
+            return None
+
+    def _encode_plain(self, prompt: str, negative: str, clip_skip: int):
+        return self.pipe.encode_prompt(
             prompt=prompt,
             prompt_2=None,
             device=self.pipe._execution_device,
             num_images_per_prompt=1,  # 枚数方向の複製はパイプライン側に任せる
             do_classifier_free_guidance=True,
             negative_prompt=negative,
-            clip_skip=clip_skip - 1 if clip_skip > 1 else None,  # diffusers は "飛ばす層数" を受ける
+            clip_skip=clip_skip - 2,  # 上の注記を参照
         )
-        self._embed_cache[key] = out
-        while len(self._embed_cache) > 8:  # 1 件 ~1.3MB (VRAM)。8 件で十分
-            self._embed_cache.popitem(last=False)
-        return out
 
     # ---------- VAE デコード ----------
     @staticmethod
