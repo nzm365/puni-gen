@@ -1,4 +1,7 @@
 """最小構成の Gradio UI。モデルを切り替えるとプリセット（推奨設定）が自動で入る。"""
+import queue
+import threading
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +39,8 @@ def on_model_change(ckpt):
         return [gr.update()] * 7
     msg = load_or_alert(ckpt)
     p = load_preset(ckpt)
+    # ユーザーがプロンプトを打っている間に、裏で 1 step 回して初回のもたつきを消す
+    threading.Thread(target=engine.warmup, args=tuple(p["size"]), daemon=True).start()
     return (
         msg,
         p["prefix_pos"],
@@ -47,6 +52,22 @@ def on_model_change(ckpt):
     )
 
 
+# 同一設定・同一 seed の再実行は定義上まったく同じ画像なので、再計算せず返す。
+# 1 件 ≒ 数 MB × 最大 4 枚。8 件までに抑える
+RESULT_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
+
+
+def _save_async(images, paths):
+    """PNG 書き込みは表示をブロックしない。GPU はこの時点で既に空いている。
+
+    compress_level 6→1 でエンコードが 2〜3 倍速くなる（ファイルは 1〜2 割大きくなる）。
+    """
+    def run():
+        for im, p in zip(images, paths):
+            im.save(p, compress_level=1)
+    threading.Thread(target=run, daemon=True).start()
+
+
 def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
                 in_image, strength):
     if engine.current != ckpt:
@@ -56,16 +77,64 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         # i2i では入力のアスペクト比を保ち、選択サイズは画素数の目安として使う
         size = fit_size(in_image.size, size[0] * size[1])
     full_prompt = (prefix or "") + prompt
-    images, used_seed = engine.generate(
-        full_prompt, negative, size[0], size[1],
-        int(steps), float(cfg), sampler, int(clip_skip), int(seed), int(n),
-        image=in_image, strength=float(strength),
-    )
+    seed, n, steps = int(seed), int(n), int(steps)
+
+    # 明示 seed の再実行（生成情報の seed を入れて再現する手順）はキャッシュから即答
+    cache_key = None
+    if seed >= 0 and in_image is None:
+        cache_key = (ckpt, full_prompt, negative, size, steps, float(cfg),
+                     sampler, int(clip_skip), seed, n)
+        hit = RESULT_CACHE.get(cache_key)
+        if hit is not None:
+            yield hit[0], hit[1] + "\n(同一設定・同一 seed のため再計算なし)"
+            return
+
+    # 生成はワーカースレッドで回し、ここでは途中経過を受け取って画面に流す
+    q: queue.Queue = queue.Queue()
+    res = {}
+
+    def worker():
+        try:
+            res["out"] = engine.generate(
+                full_prompt, negative, size[0], size[1],
+                steps, float(cfg), sampler, int(clip_skip), seed, n,
+                image=in_image, strength=float(strength),
+                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
+            )
+        except Exception as e:  # noqa: BLE001
+            res["err"] = e
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    while (msg := q.get()) is not None:
+        s, total, imgs = msg
+        if imgs is not None:
+            yield imgs, f"生成中... {s}/{total} step（途中プレビュー）"
+        else:
+            yield gr.update(), f"生成中... {s}/{total} step"
+    if "err" in res:
+        e = res["err"]
+        raise e if isinstance(e, gr.Error) else gr.Error(str(e))
+
+    images, used_seed, perf = res["out"]
+    if images is None:  # 中止された
+        yield gr.update(), "中止しました（画像は保存されません）"
+        return
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for i, im in enumerate(images):
-        im.save(OUT_DIR / f"{stamp}_{used_seed + i}.png")
+    paths = [OUT_DIR / f"{stamp}_{used_seed + i}.png" for i in range(len(images))]
+    _save_async(images, paths)  # 保存完了を待たずに表示する
     mode = f"i2i (strength {strength})" if in_image is not None else "t2i"
-    return images, f"seed: {used_seed}  size: {size[0]}x{size[1]}  mode: {mode}  prompt: {full_prompt}"
+    info = (
+        f"seed: {used_seed}  size: {size[0]}x{size[1]}  mode: {mode}  prompt: {full_prompt}\n"
+        f"[{perf}]"
+    )
+    if cache_key is not None:
+        RESULT_CACHE[cache_key] = (images, info)
+        while len(RESULT_CACHE) > 8:
+            RESULT_CACHE.popitem(last=False)
+    yield images, info
 
 
 # ---------- モデルを追加（Civitai） ----------
@@ -136,7 +205,9 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                     aspect = gr.Radio(list(ASPECTS), value="縦 (プリセット)", label="サイズ")
                     n = gr.Slider(1, 4, 1, step=1, label="枚数")
 
-                go = gr.Button("生成", variant="primary")
+                with gr.Row():
+                    go = gr.Button("生成", variant="primary", scale=3)
+                    stop = gr.Button("中止", variant="stop", scale=1)
 
                 with gr.Accordion("img2img（画像を置くと、その画像を下敷きに生成）", open=False):
                     in_image = gr.Image(
@@ -212,6 +283,8 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
          in_image, strength],
         [gallery, info],
     )
+    # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
+    stop.click(engine.request_cancel, None, None)
     if ckpts:
         demo.load(on_model_change, model_dd, preset_outputs)
 

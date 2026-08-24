@@ -12,6 +12,7 @@ models/embeddings/*
 # 生成結果
 outputs/*
 !outputs/.keep
+tools/quality_runs/
 
 # Gradio / キャッシュ
 .gradio/
