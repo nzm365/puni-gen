@@ -24,6 +24,8 @@ ROOT = Path(__file__).parent
 CKPT_DIR = ROOT / "models" / "checkpoints"
 EMB_DIR = ROOT / "models" / "embeddings"
 PRESET_DIR = ROOT / "presets"
+# fp16 VAE が NaN を出したモデル名の記録 (次回起動から最初から fp32 でデコードする)
+VAE_FP32_FILE = ROOT / ".vae_fp32.json"
 
 # 重み以外に要る作業用 VRAM のおおよその見積り（活性値・アテンション・VAE デコード）。
 # 配置の判定はこの値を起点に決まるので、環境に合わせて調整するならここ。
@@ -142,8 +144,13 @@ class Engine:
         # (モデル, プロンプト, ネガティブ, clip_skip) → encode_prompt の結果。
         # seed だけ変えて連打する使い方ではテキストエンコーダ 2 基を毎回回す必要がない
         self._embed_cache: OrderedDict[tuple, tuple] = OrderedDict()
-        # fp16 デコードで NaN/Inf を出した実績のあるモデル名 (以後そのモデルは fp32 でデコード)
+        # fp16 デコードで NaN/Inf を出した実績のあるモデル名 (以後そのモデルは fp32 でデコード)。
+        # ディスクに永続化し、次回起動では fp16 で探り直さない（無駄な二重デコードを防ぐ）
         self._vae_fp32: set[str] = set()
+        try:
+            self._vae_fp32 = set(json.loads(VAE_FP32_FILE.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
         self._taesd = None  # AutoencoderTiny | "unavailable" | None (未初期化)
         self._taesd_started = False
         if torch.cuda.is_available():
@@ -193,6 +200,10 @@ class Engine:
         # fp16 デコードで NaN を出した実績のあるモデルだけ fp32 に昇格させる。
         # (デコードは _decode_latents が自前で制御する。このフラグは i2i の encode 側に効く)
         pipe.vae.config.force_upcast = ckpt_name in self._vae_fp32
+        if not offload and ckpt_name in self._vae_fp32:
+            # 既知の fp16 非対応モデルはロード時点で bf16 に昇格させ、
+            # 初回生成の fp16 探り直し (NaN → 撮り直し) を省く
+            pipe.vae.to(torch.bfloat16)
         self._offload = offload
         self.current = ckpt_name
         if not self._taesd_started:  # プレビュー用の軽量 VAE を裏で用意しておく
@@ -325,11 +336,28 @@ class Engine:
         return out
 
     # ---------- VAE デコード ----------
+    @staticmethod
+    @contextlib.contextmanager
+    def _no_cudnn_benchmark():
+        """VAE デコードの間だけ cuDNN のカーネル探索を止める。
+
+        benchmark は「同じ形状を何度も回す」UNet では元が取れるが、1 生成 1 回の
+        VAE デコードでは、832x1216 級の巨大 conv の総当たり探索に数十秒かかる
+        (73 秒を実測) 割に縮むのは 0.1 秒級で大損。ヒューリスティック選択で即決させる。
+        """
+        prev = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.benchmark = False
+        try:
+            yield
+        finally:
+            torch.backends.cudnn.benchmark = prev
+
     def _decode_latents(self, latents: torch.Tensor) -> list[Image.Image]:
         """latent を 1 枚ずつ画像へ。fp16 一括デコードを基本に、二段の安全網を持つ。
 
-        - fp16 の結果に NaN/Inf → そのモデルを fp32 デコードに切り替えて撮り直し
-          (2023 年型の fp16 非対応 VAE への対処。Illustrious 系マージはほぼ fp16 安全版)
+        - fp16 の結果に NaN/Inf → そのモデルを bf16 デコードに切り替えて撮り直し。
+          NaN の原因は fp16 の値域あふれで、bf16 は fp32 と同じ値域を持つため出ない。
+          速度は fp16 並み (fp32 の約 4 倍速)、fp32 との画素差は平均 0.3/255 で不可視 (実測)
         - VRAM に載らない (OOM) → タイル分割を有効にして撮り直し
         1 枚ずつ回すのはバッチ n 枚のピークを 1 枚分に抑えるため (enable_slicing 相当)。
         """
@@ -342,39 +370,73 @@ class Engine:
             lat = latents * std / cfg.scaling_factor + mean
         else:
             lat = latents / cfg.scaling_factor
-        use_fp32 = self.current in self._vae_fp32
-        if use_fp32:
-            pipe.upcast_vae()
+        if self.current in self._vae_fp32 and vae.dtype == torch.float16:
+            vae.to(torch.bfloat16)  # 既知の fp16 非対応モデル。最初から bf16 で回す
+        if not getattr(vae, "use_tiling", False):
+            # 一括デコードは、VRAM の空きが足りないと OOM 例外を出さずに共有メモリへ
+            # 溢れて数十秒〜数分級になる (Windows の仕様)。例外で捕まえられないので、
+            # 必要量を見積もって足りなければ事前にタイル分割へ落とす。
+            # 必要量はデコード活性のピーク実測から: おおよそ 5500 bytes/出力ピクセル
+            # (fp16/bf16。4400 では判定を通ったのに peak 13.5GB まで溢れたため保守的に)
+            pixels = lat.shape[-2] * lat.shape[-1] * 64  # latent 1 画素 = 出力 8x8 画素
+            need = pixels * (11000 if vae.dtype == torch.float32 else 5500)
+            free = torch.cuda.mem_get_info()[0]
+            avail = free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+            if avail < need:
+                print(f"[vae] 空き VRAM が一括デコードに足りないためタイル分割で実行 "
+                      f"(必要 ~{need / 1024**3:.1f}GB / 利用可 {avail / 1024**3:.1f}GB)")
+                vae.enable_tiling()
         pils: list[Image.Image] = []
+        with self._no_cudnn_benchmark():
+            pils = self._decode_loop(lat, pils)
+        # デコードで一時的に膨らんだ予約が物理 VRAM を超えたままだと、次の生成が
+        # 共有メモリ退避の影響を引きずって数割遅くなる。超過時のみ返却する
+        props = torch.cuda.get_device_properties(0)
+        if torch.cuda.memory_reserved() > props.total_memory * 0.9:
+            torch.cuda.empty_cache()
+        return pils
+
+    def _decode_loop(self, lat, pils) -> list[Image.Image]:
+        pipe = self.pipe
+        vae = pipe.vae
         i = 0
-        try:
-            while i < lat.shape[0]:
-                one = lat[i:i + 1]
-                try:
-                    if use_fp32:
-                        img = vae.decode(one.to(torch.float32), return_dict=False)[0]
+        while i < lat.shape[0]:
+            one = lat[i:i + 1]
+            try:
+                img = vae.decode(one.to(vae.dtype), return_dict=False)[0]
+                if vae.dtype != torch.float32 and bool(
+                    torch.isnan(img).any() | torch.isinf(img).any()
+                ):
+                    if vae.dtype == torch.float16:
+                        # fp16 で壊れる VAE。このモデルは以後 bf16 でデコードする
+                        self._vae_fp32.add(self.current)
+                        try:  # 次回起動から探り直さないよう記録（失敗しても動作に影響なし）
+                            VAE_FP32_FILE.write_text(
+                                json.dumps(sorted(self._vae_fp32), ensure_ascii=False),
+                                encoding="utf-8",
+                            )
+                        except OSError:
+                            pass
+                        vae.config.force_upcast = True
+                        vae.to(torch.bfloat16)
+                        print(f"[vae] {self.current}: fp16 デコードが NaN/Inf を出したため bf16 に切替")
                     else:
-                        img = vae.decode(one.to(vae.dtype), return_dict=False)[0]
-                        if bool(torch.isnan(img).any() | torch.isinf(img).any()):
-                            # fp16 で壊れる VAE。このモデルは以後 fp32 でデコードする
-                            self._vae_fp32.add(self.current)
-                            vae.config.force_upcast = True
-                            use_fp32 = True
-                            pipe.upcast_vae()
-                            print(f"[vae] {self.current}: fp16 デコードが NaN/Inf を出したため fp32 に切替")
-                            continue
-                except torch.cuda.OutOfMemoryError:
-                    if getattr(vae, "use_tiling", False):
-                        raise  # タイル分割でも溢れた。これ以上は退避先がない
-                    print("[vae] 一括デコードが VRAM に載らないためタイル分割に切替")
-                    torch.cuda.empty_cache()
-                    vae.enable_tiling()
+                        # bf16 でも NaN (理論上ほぼ起きない)。最後の砦の fp32 + タイル分割へ
+                        vae.to(torch.float32)
+                        vae.enable_tiling()
+                        print(f"[vae] {self.current}: bf16 でも NaN/Inf のため fp32 (タイル分割) に切替")
                     continue
-                pils += pipe.image_processor.postprocess(img.float(), output_type="pil")
-                i += 1
-        finally:
-            if use_fp32:
-                vae.to(torch.float16)  # 次の生成に fp32 の VAE を残さない
+            except torch.cuda.OutOfMemoryError:
+                if getattr(vae, "use_tiling", False):
+                    raise  # タイル分割でも溢れた。これ以上は退避先がない
+                print("[vae] 一括デコードが VRAM に載らないためタイル分割に切替")
+                torch.cuda.empty_cache()
+                vae.enable_tiling()
+                continue
+            pils += pipe.image_processor.postprocess(img.float(), output_type="pil")
+            i += 1
+        # 注: bf16 に昇格した VAE は fp16 へ戻さない。戻すと毎生成で往復キャストを払う上、
+        # どうせ次の生成でまた bf16 が必要になる。サイズは fp16 と同じで常駐コストもない
         return pils
 
     # ---------- 途中プレビュー ----------
@@ -398,9 +460,13 @@ class Engine:
         w, h = max(size[0] // 2, 8), max(size[1] // 2, 8)  # プレビューは半分の解像度で十分
         dec = self._taesd
         if dec is not None and not isinstance(dec, str):
-            img = dec.decode(latents.to(dec.dtype)).sample
+            # latent を 1/2 に縮めてからデコードする。出力がちょうど半分解像度になるので
+            # 後段のリサイズが不要になり、デコードと PIL 変換のコストも 1/4 で済む
+            # (プレビューは denoise ループ内で走るため、ここの重さがそのまま生成時間に乗る)
+            small = torch.nn.functional.avg_pool2d(latents.to(dec.dtype), 2)
+            img = dec.decode(small).sample
             pils = self.pipe.image_processor.postprocess(img.float(), output_type="pil")
-            return [im.resize((w, h), Image.BILINEAR) for im in pils]
+            return [im if im.size == (w, h) else im.resize((w, h), Image.BILINEAR) for im in pils]
         m = _LATENT_RGB.to(latents.device, latents.dtype)
         rgb = torch.einsum("nchw,cr->nrhw", latents, m)
         rgb = ((rgb + 1) / 2).clamp(0, 1).mul(255).round().byte().cpu()
@@ -483,18 +549,34 @@ class Engine:
         # i2i の実効 step 数は steps × strength (diffusers の仕様)
         total = steps if image is None else max(1, int(steps * strength))
 
+        # プレビュー生成 (TAESD デコード + PIL 変換で計 0.6 秒級) を denoise ループから
+        # 追い出すための状態。latent だけ複製して別スレッドに渡し、GPU の本計算を止めない。
+        # 前のプレビューが作成中なら今回はスキップする (busy フラグ)
+        pv_busy = threading.Event()
+
+        def make_preview(done, snap):
+            try:
+                # snap は inference_mode 下で作られたテンソルなので、
+                # 別スレッド側も inference_mode に入っていないと演算が例外になる
+                with torch.inference_mode():
+                    pv = self._preview_images(snap, (width, height))
+            except Exception:  # noqa: BLE001 — プレビュー失敗で生成を殺さない
+                pv = None
+            finally:
+                pv_busy.clear()
+            if pv is not None:
+                preview_cb(done, total, pv)
+
         def cb(pipe, i, t, kw):
             if self.cancel.is_set():
                 pipe._interrupt = True  # 残りのループを空回りさせて即座に抜ける
             elif preview_cb is not None:
                 done = i + 1
-                pv = None
-                if done % PREVIEW_EVERY == 0 and done < total:
-                    try:
-                        pv = self._preview_images(kw["latents"], (width, height))
-                    except Exception:  # noqa: BLE001 — プレビュー失敗で生成を殺さない
-                        pv = None
-                preview_cb(done, total, pv)
+                if done % PREVIEW_EVERY == 0 and done < total and not pv_busy.is_set():
+                    pv_busy.set()
+                    snap = kw["latents"].detach().clone()  # 数 MB。以後ループとは独立
+                    threading.Thread(target=make_preview, args=(done, snap), daemon=True).start()
+                preview_cb(done, total, None)  # step 数の表示は毎 step 更新する
             return {}
 
         common = dict(

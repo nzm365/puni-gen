@@ -28,6 +28,9 @@ flagged/
 .env
 config.local.json
 
+# 実行時に学習した環境依存の記録（fp16 VAE が NaN を出したモデルの一覧）
+.vae_fp32.json
+
 # OS / エディタ
 .DS_Store
 Thumbs.db
