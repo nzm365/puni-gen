@@ -53,6 +53,25 @@ USE_FUSE_QKV = False        # +約1.2GB。12GB では VRAM が溢れて逆効果
 # 何ステップごとに途中プレビューを出すか
 PREVIEW_EVERY = 3
 
+# ---------- 高解像度化 (Hires.fix) ----------
+# 生成済み画像を拡大してから img2img で描き直し、細部を足す。
+HIRES_SCALE = 1.5          # 倍率。832x1216 -> 1248x1824 (画素数 2.25 倍)
+HIRES_STRENGTH = 0.35      # 変化の強さ。高すぎると元の構図が崩れる
+HIRES_STEPS = 20           # 実効 step は steps x strength なので 20x0.35 = 7 step 相当
+
+# 拡大後の UNet は画素数に比例して活性値が増える。12GB では 2 倍 (画素数 4 倍) が
+# 載らないため既定は 1.5 倍 (画素数 2.25 倍)。それでも通常生成より重いので、
+# この画素数を超えたらアテンションを分割して山を削る。
+# 速度は落ちるが、共有メモリへ溢れて数十倍遅くなるよりはるかにまし。
+# 1248x1824 = 2.28MP なので 1.5 倍でも分割が入る。
+ATTENTION_SLICING_PIXELS = 2000 * 1000
+
+# ---------- 変分 (variation seed) ----------
+# 気に入った絵の seed を保ったまま、少しだけ違う絵を出す。A1111 の variation seed 相当。
+# 元のノイズと別 seed のノイズを球面補間で混ぜる。0 で完全に同じ絵、1 で無関係な絵。
+VARIATION_STRENGTH = 0.15  # 「もう少し違うのが欲しい」に合う程度の振れ幅
+VARIATION_COUNT = 2        # 一度に出す枚数
+
 # latent → RGB の線形近似係数 (ComfyUI が SDXL プレビューに使っているもの)。
 # TAESDXL が使えない環境向けの、依存ゼロ・ほぼゼロコストのフォールバック
 _LATENT_RGB = torch.tensor([
@@ -65,6 +84,40 @@ _LATENT_RGB = torch.tensor([
 # 単一ファイル形式のチェックポイントで UNet が持つキーの接頭辞。
 # オフロード時は「一番大きい単体モジュール = UNet」が VRAM ピークになる。
 UNET_PREFIX = "model.diffusion_model."
+
+
+def slerp(t: float, v0: torch.Tensor, v1: torch.Tensor, dot_threshold: float = 0.9995):
+    """2 つのノイズを球面線形補間で混ぜる。
+
+    単純な線形補間だと混ぜた分だけノルムが縮み、ノイズの分散が変わって
+    絵が眠くなる。球面補間なら大きさを保ったまま向きだけを寄せられる。
+    """
+    v0f, v1f = v0.double(), v1.double()
+    n0 = v0f / torch.norm(v0f)
+    n1 = v1f / torch.norm(v1f)
+    dot = (n0 * n1).sum()
+    if dot.abs() > dot_threshold:  # ほぼ平行なら補間の意味がないので線形で十分
+        out = (1 - t) * v0f + t * v1f
+    else:
+        theta0 = torch.acos(dot)
+        sin0 = torch.sin(theta0)
+        s0 = torch.sin((1 - t) * theta0) / sin0
+        s1 = torch.sin(t * theta0) / sin0
+        out = s0 * v0f + s1 * v1f
+    return out.to(v0.dtype)
+
+
+def safe_vae_dtype() -> torch.dtype:
+    """fp16 VAE が NaN を出すモデルの退避先 dtype を返す。
+
+    bf16 は fp32 と同じ値域を持ちながら fp16 並みに速いので第一候補。
+    ただし Ampere (compute capability 8.0) 以上でないと対応しないため、
+    対応していない GPU では fp32 に落とす（対象の RTX 30/40/50 は全て対応済み。
+    範囲外の GPU で動かされたときに、静かに壊れず遅いだけで済むようにする保険）。
+    """
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float32
 
 
 class InsufficientVram(RuntimeError):
@@ -205,7 +258,7 @@ class Engine:
         if not offload and ckpt_name in self._vae_fp32:
             # 既知の fp16 非対応モデルはロード時点で bf16 に昇格させ、
             # 初回生成の fp16 探り直し (NaN → 撮り直し) を省く
-            pipe.vae.to(torch.bfloat16)
+            pipe.vae.to(safe_vae_dtype())
         self._offload = offload
         self.current = ckpt_name
         if not self._taesd_started:  # プレビュー用の軽量 VAE を裏で用意しておく
@@ -412,7 +465,8 @@ class Engine:
         else:
             lat = latents / cfg.scaling_factor
         if self.current in self._vae_fp32 and vae.dtype == torch.float16:
-            vae.to(torch.bfloat16)  # 既知の fp16 非対応モデル。最初から bf16 で回す
+            # 既知の fp16 非対応モデル。最初から安全な dtype (bf16、無ければ fp32) で回す
+            vae.to(safe_vae_dtype())
         if not getattr(vae, "use_tiling", False):
             # 一括デコードは、VRAM の空きが足りないと OOM 例外を出さずに共有メモリへ
             # 溢れて数十秒〜数分級になる (Windows の仕様)。例外で捕まえられないので、
@@ -459,13 +513,16 @@ class Engine:
                         except OSError:
                             pass
                         vae.config.force_upcast = True
-                        vae.to(torch.bfloat16)
-                        print(f"[vae] {self.current}: fp16 デコードが NaN/Inf を出したため bf16 に切替")
+                        alt = safe_vae_dtype()
+                        vae.to(alt)
+                        name = "bf16" if alt == torch.bfloat16 else "fp32"
+                        print(f"[vae] {self.current}: fp16 デコードが NaN/Inf を出したため {name} に切替")
                     else:
                         # bf16 でも NaN (理論上ほぼ起きない)。最後の砦の fp32 + タイル分割へ
                         vae.to(torch.float32)
                         vae.enable_tiling()
                         print(f"[vae] {self.current}: bf16 でも NaN/Inf のため fp32 (タイル分割) に切替")
+
                     continue
             except torch.cuda.OutOfMemoryError:
                 if getattr(vae, "use_tiling", False):
@@ -540,6 +597,102 @@ class Engine:
             line += "  ⚠ VRAM 上限付近 — 共有メモリ退避で激遅になっている可能性"
         return line
 
+    @contextlib.contextmanager
+    def _attention_slicing_for(self, width: int, height: int):
+        """高解像度のときだけアテンションを分割する。
+
+        SDXL の活性値は画素数にほぼ比例するので、2 倍 (画素数 4 倍) では 12GB に載らない。
+        分割すると速度は落ちるが、溢れて共有メモリに退避するよりは桁違いに速い。
+        通常解像度では何もしない (分割は純粋なオーバーヘッドなので)。
+        """
+        need = width * height > ATTENTION_SLICING_PIXELS
+        if not need:
+            yield
+            return
+        self.pipe.enable_attention_slicing()
+        try:
+            yield
+        finally:
+            self.pipe.disable_attention_slicing()
+
+    # ---------- 高解像度化 (Hires.fix) ----------
+    def upscale(self, image, prompt: str, negative: str, cfg: float, sampler: str,
+                clip_skip: int, seed: int, scale: float = HIRES_SCALE,
+                strength: float = HIRES_STRENGTH, steps: int = HIRES_STEPS,
+                preview_cb=None):
+        """生成済み画像を拡大し、img2img で細部を描き足す。
+
+        返り値は generate と同じ (images | None, seed, 計測行)。
+        拡大自体は img2img 経路が入力画像をリサイズして行う。
+        """
+        assert self.pipe is not None, "model not loaded"
+        w = max(8, int(image.width * scale) // 8 * 8)
+        h = max(8, int(image.height * scale) // 8 * 8)
+        return self.generate(
+            prompt, negative, w, h, steps, cfg, sampler, clip_skip, seed, 1,
+            image=image, strength=strength, preview_cb=preview_cb,
+        )
+
+    # ---------- 変分 (この絵を少しだけ変える) ----------
+    def variation_latents(self, seed: int, width: int, height: int, count: int,
+                          strength: float = VARIATION_STRENGTH):
+        """元の seed のノイズを保ちつつ、少しだけずらしたノイズを count 個作る。
+
+        A1111 の variation seed と同じ考え方。元ノイズと別 seed のノイズを
+        球面補間で混ぜるので、構図や色を残したまま細部だけが変わる。
+        """
+        dev = self.pipe._execution_device
+        ch = self.pipe.unet.config.in_channels
+        shape = (1, ch, height // 8, width // 8)
+        dtype = self.pipe.unet.dtype
+        g = torch.Generator(device=dev).manual_seed(int(seed))
+        base = torch.randn(shape, generator=g, device=dev, dtype=dtype)
+        mixed = []
+        for i in range(count):
+            # 変分側の seed は元 seed から決定的に導く（同じ絵からは毎回同じ枚数分が出る）
+            gv = torch.Generator(device=dev).manual_seed(int(seed) + 100003 * (i + 1))
+            v = torch.randn(shape, generator=gv, device=dev, dtype=dtype)
+            mixed.append(slerp(strength, base, v))
+        # init_noise_sigma は掛けない。diffusers の prepare_latents が、渡した latents にも
+        # 必ず掛けるため（pipeline_stable_diffusion_xl.py の "scale the initial noise" の行）。
+        # ここで掛けると二乗になり、Euler 系では約 214 倍のノイズになって絵が壊れる。
+        return torch.cat(mixed, dim=0)
+
+    def _variation_generators(self, seed: int, width: int, height: int, n: int):
+        """変分用の generator を、通常経路と同じ乱数位置に揃えて作る。
+
+        euler_a などの ancestral 系サンプラは毎ステップ generator からノイズを引く。
+        通常経路では prepare_latents が初期ノイズ生成で generator を 1 回消費するが、
+        変分では latents を自前で渡すため消費されない。そのままだと以降のノイズ列が
+        丸ごとずれ、元の絵とまったく似ない絵が出る（実測で相関 +0.15 まで落ちた）。
+        ここで同じ形の randn を 1 回空引きして位置を合わせる。
+
+        さらに、全変分で同じ seed を使う。こうすると各ステップのノイズが全変分で共通になり、
+        違いは初期 latents だけになる = 元の絵を保ったまま細部だけ変わる。
+        """
+        dev = self.pipe._execution_device
+        ch = self.pipe.unet.config.in_channels
+        shape = (1, ch, height // 8, width // 8)
+        dtype = self.pipe.unet.dtype
+        gens = []
+        for _ in range(n):
+            g = torch.Generator(device=dev).manual_seed(int(seed))
+            torch.randn(shape, generator=g, device=dev, dtype=dtype)  # 位置合わせの空引き
+            gens.append(g)
+        return gens
+
+    def variations(self, prompt: str, negative: str, width: int, height: int, steps: int,
+                   cfg: float, sampler: str, clip_skip: int, seed: int,
+                   count: int = VARIATION_COUNT, strength: float = VARIATION_STRENGTH,
+                   preview_cb=None):
+        """気に入った絵の seed を固定したまま、少しだけ違う絵を count 枚出す。"""
+        assert self.pipe is not None, "model not loaded"
+        lat = self.variation_latents(seed, width, height, count, strength)
+        return self.generate(
+            prompt, negative, width, height, steps, cfg, sampler, clip_skip, seed, count,
+            preview_cb=preview_cb, init_latents=lat,
+        )
+
     # ---------- 生成 ----------
     def set_sampler(self, name: str):
         assert self.pipe is not None
@@ -573,6 +726,7 @@ class Engine:
         image=None,
         strength: float = 0.6,
         preview_cb=None,
+        init_latents=None,
     ):
         """返り値: (images | None, seed, 計測行)。中止されたときは images が None。"""
         assert self.pipe is not None, "model not loaded"
@@ -582,7 +736,10 @@ class Engine:
         self.set_sampler(sampler)
         if seed < 0:
             seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
-        gens = [torch.Generator("cuda").manual_seed(seed + i) for i in range(n)]
+        if init_latents is None:
+            gens = [torch.Generator("cuda").manual_seed(seed + i) for i in range(n)]
+        else:
+            gens = self._variation_generators(seed, width, height, n)
 
         with self._phase(phases, "embed"):
             pe, ne, pp, pn = self._get_embeds(prompt, negative, clip_skip)
@@ -624,18 +781,25 @@ class Engine:
             prompt_embeds=pe, negative_prompt_embeds=ne,
             pooled_prompt_embeds=pp, negative_pooled_prompt_embeds=pn,
             num_images_per_prompt=n,
-            width=width, height=height,
             num_inference_steps=steps,
             guidance_scale=cfg,
             generator=gens,
             output_type="latent",  # デコードは _decode_latents で自前制御する
             callback_on_step_end=cb,
         )
-        with self._phase(phases, "unet"):
+        with self._phase(phases, "unet"), self._attention_slicing_for(width, height):
             if image is not None:  # 入力画像があれば img2img
-                latents = self.pipe_i2i(image=image.convert("RGB"), strength=strength, **common).images
+                # img2img パイプは width/height を受け取らず (**kwargs に吸われて無視され)、
+                # 出力サイズは入力画像のサイズそのものになる。狙った解像度で出すには
+                # 渡す前に自前でリサイズする必要がある。Hires.fix もこの経路で拡大する
+                src = image.convert("RGB")
+                if src.size != (width, height):
+                    src = src.resize((width, height), Image.LANCZOS)
+                latents = self.pipe_i2i(image=src, strength=strength, **common).images
             else:
-                latents = self.pipe(**common).images
+                if init_latents is not None:  # 変分: 混ぜた初期ノイズを指定する
+                    common["latents"] = init_latents
+                latents = self.pipe(width=width, height=height, **common).images
 
         if self.cancel.is_set():
             return None, seed, self._perf_line(phases, 0)  # 中断: デコード代も払わない
