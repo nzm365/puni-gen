@@ -2,7 +2,11 @@
 
 diffusers ベースの SDXL / Illustrious 系画像生成ツールです。ComfyUI もグローバルな Python 環境も使いません。`setup.bat` と `start.bat` を順に実行すれば動きます。
 
-![RTX Easy Image Gen の画面](docs/screenshot.png)
+![RTX Easy Image Gen の画面](docs/screenshot0.png)
+
+![RTX Easy Image Gen の画面](docs/screenshot1.png)
+
+
 
 ## 主な機能
 
