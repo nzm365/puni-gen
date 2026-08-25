@@ -15,10 +15,10 @@ TAGS_CSV = Path(__file__).parent / "data" / "danbooru_tags.csv"
 # 補完対象の textarea（app.py 側で elem_id を合わせる）
 TARGET_IDS = ["prompt_box", "neg_box"]
 
-# category → (色, ラベル)。Danbooru の区分に合わせる
+# category → (色, ラベル)。Danbooru の区分に合わせる。
+# 絵師名 (category 1) は辞書生成の段階で除外しているのでここにも持たない
 CAT_META = {
     0: ("#8cc4ff", "一般"),
-    1: ("#f5a3a3", "絵師"),
     3: ("#d6a5f5", "版権"),
     4: ("#8ee6a0", "キャラ"),
     6: ("#f5d264", "埋込"),   # このツール独自: embedding のトリガーワード
