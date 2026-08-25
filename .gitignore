@@ -12,6 +12,10 @@ models/embeddings/*
 # 生成結果
 outputs/*
 !outputs/.keep
+
+# お気に入り（生成画像なので同じく管理外）
+favorites/*
+!favorites/.keep
 tools/quality_runs/
 
 # Gradio / キャッシュ

@@ -25,6 +25,22 @@ CAT_META = {
 }
 
 
+def _js_json(obj) -> str:
+    """<script> の中に直接埋め込める JSON を作る。
+
+    json.dumps は "<" や "/" をエスケープしないので、値に "</script>" が含まれると
+    そこでスクリプトが閉じてしまい、任意の HTML を差し込まれる。
+    embedding のファイル名もタグ辞書も外部から来る文字列なので、
+    閉じタグを構成できない形に落としてから埋め込む。
+    """
+    return (
+        json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+        .replace("<", r"\u003c")
+        .replace(">", r"\u003e")
+        .replace("&", r"\u0026")
+    )
+
+
 def _load_tags() -> list[list]:
     if not TAGS_CSV.exists():
         return []
@@ -42,8 +58,8 @@ def build_head(embeddings: list[str] | None = None) -> str:
         return ""
     # embedding のトリガーワードを最優先で先頭に。count は最大扱いで常に上位に出す
     data = [[e, 6, 1 << 62] for e in (embeddings or [])] + tags
-    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    cfg = json.dumps({
+    payload = _js_json(data)
+    cfg = _js_json({
         "ids": TARGET_IDS,
         "cats": {str(k): v[0] for k, v in CAT_META.items()},
         "max": 12,
