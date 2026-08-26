@@ -1,4 +1,8 @@
 # 改行コード：Windows 用スクリプトは CRLF、それ以外は LF に正規化
 * text=auto eol=lf
-*.bat text eol=crlf
-*.cmd text eol=crlf
+
+# .bat は CP932 (Shift_JIS) + CRLF で保存している。
+# cmd はバッチ本体をコンソールのコードページで読むため、UTF-8 だと日本語の
+# 途中で行の読み取り位置がずれて壊れる。git に中身を触らせないよう -text にする
+*.bat -text
+*.cmd -text
