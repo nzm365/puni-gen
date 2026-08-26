@@ -275,8 +275,20 @@ def on_upscale(last, idx):
 
 
 # ---------- お気に入り ----------
-FAV_LABEL = "★"          # 未登録
-FAV_LABEL_DONE = "★ 済"  # 登録済み
+# 星はフォントに任せると字形が環境ごとに変わって見栄えがしない。
+# Gradio のボタンはラベルの HTML をエスケープするので、SVG を直接は埋め込めない。
+# そこで elem_classes で状態を伝え、実際の星は CSS の背景画像として描く
+# （ui_style.py 側で定義）。ラベル自体は空にしておく。
+FAV_CLASS = "fav-btn"          # 未登録
+FAV_CLASS_DONE = "fav-btn on"  # 登録済み
+
+
+def _fav_name(state, idx) -> str | None:
+    """選択中の画像のファイル名を返す（お気に入りの判定と移動に使う）。"""
+    if not state or not state.get("paths"):
+        return None
+    i = 0 if idx is None else min(int(idx), len(state["paths"]) - 1)
+    return Path(state["paths"][i]).name
 
 
 def _fav_button(state, idx):
@@ -284,14 +296,15 @@ def _fav_button(state, idx):
 
     済みのときは primary（塗りつぶし）にして、ラベルにも印を付ける。
     色だけだと分かりにくい環境があるので、両方で示す。
+    押すと解除できるので、済みでも押せる状態のままにする。
     """
-    if not state or not state.get("paths"):
-        return gr.update(value=FAV_LABEL, variant="secondary", interactive=True)
-    i = 0 if idx is None else min(int(idx), len(state["paths"]) - 1)
-    name = Path(state["paths"][i]).name
-    if (FAV_DIR / name).exists():
-        return gr.update(value=FAV_LABEL_DONE, variant="primary", interactive=False)
-    return gr.update(value=FAV_LABEL, variant="secondary", interactive=True)
+    name = _fav_name(state, idx)
+    on = bool(name and (FAV_DIR / name).exists())
+    return gr.update(
+        variant="primary" if on else "secondary",
+        elem_classes=FAV_CLASS_DONE if on else FAV_CLASS,
+        interactive=True,
+    )
 
 
 def list_favorites():
@@ -303,29 +316,42 @@ def list_favorites():
 
 
 def on_favorite(last, idx):
-    """選択中の画像を outputs から favorites へ移す。"""
+    """選択中の画像のお気に入り状態を切り替える。
+
+    追加は outputs から favorites への移動、解除はその逆。
+    元の場所へ戻すので、解除しても画像は消えず履歴に並ぶ。
+    """
     if not last or not last.get("images"):
         return "先に画像を生成してください。", gr.update()
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
     FAV_DIR.mkdir(exist_ok=True)
 
-    src = Path(last["paths"][i])
-    dst = FAV_DIR / src.name
-    if dst.exists():
-        return f"すでにお気に入りにあります: {dst.name}", gr.update()
+    name = Path(last["paths"][i]).name
+    in_out = OUT_DIR / name
+    in_fav = FAV_DIR / name
 
+    # --- 解除 ---
+    if in_fav.exists():
+        if in_out.exists():
+            # 同名が両方にある（手で戻した等）。favorites 側だけ消して整合させる
+            in_fav.unlink()
+        else:
+            shutil.move(str(in_fav), str(in_out))
+        return f"お気に入りから外しました: {name}", gr.update(value=list_favorites())
+
+    # --- 追加 ---
     # 保存は裏で走っているので、書き終わるまで少しだけ待つ
     for _ in range(20):
-        if src.exists():
+        if in_out.exists():
             break
         time.sleep(0.1)
 
-    if src.exists():
-        shutil.move(str(src), str(dst))
+    if in_out.exists():
+        shutil.move(str(in_out), str(in_fav))
     else:  # 保存が間に合わない場合はメモリ上の画像から直接書く
-        images[i].save(dst, compress_level=1)
-    return f"お気に入りに移動しました: {dst.name}", gr.update(value=list_favorites())
+        images[i].save(in_fav, compress_level=1)
+    return f"お気に入りに追加しました: {name}", gr.update(value=list_favorites())
 
 
 def on_refresh_favorites():
@@ -412,6 +438,17 @@ def list_history():
 def on_refresh_history():
     files = list_history()
     return gr.update(value=files), f"{len(files)} 枚", None, "画像を選ぶと操作できます。"
+
+
+def on_refresh_history_keep():
+    """一覧だけ更新し、選択中の画像は保つ。
+
+    お気に入りの追加・解除の直後に使う。通常の更新は選択を解除するが、
+    それだと解除した直後にもう一度押せず、「履歴から画像を選んでください」と
+    出てしまう（実際にそうなっていた）。
+    """
+    files = list_history()
+    return gr.update(value=files), f"{len(files)} 枚"
 
 
 def on_pick_history(evt: gr.SelectData):
@@ -638,7 +675,10 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                             f"解像度を {HIRES_SCALE:g} 倍", variant="secondary", scale=3
                         )
                         # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
-                        favorite = gr.Button(FAV_LABEL, variant="secondary", scale=1)
+                        favorite = gr.Button(
+                            "", variant="secondary", scale=1,
+                            elem_classes=FAV_CLASS,
+                        )
                     info = gr.Textbox(label="生成情報", interactive=False, lines=2)
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
@@ -773,10 +813,14 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
     ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
 
     # お気に入りは画像が増えないのでサブタブは切り替えない
+    # 追加・解除で outputs と favorites の間を移動するので一覧は更新するが、
+    # 選択は保つ（続けて押し直せるようにするため）
     favorite.click(
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
-    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+    ).then(fav_button_state, *_fav_args).then(
+        on_refresh_history_keep, None, [hist_gallery, hist_count]
+    )
 
     fav_tab.select(on_refresh_favorites, None, [fav_gallery, fav_count])
     demo.load(on_refresh_favorites, None, [fav_gallery, fav_count])
