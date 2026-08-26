@@ -24,6 +24,9 @@ safetensors==0.8.0
 gradio==6.25.0
 pillow==12.3.0
 
+# 拡大用モデル (Real-ESRGAN) の読み込み
+spandrel==0.4.2
+
 # プロンプトの重み付き構文と 77 トークン超の解釈。
 # compel 本体は notebook (Jupyter 一式) を依存に宣言しているが実行時には読まない。
 # ロックに Jupyter 一式を持ち込みたくないので、ここには pyparsing だけを書き、

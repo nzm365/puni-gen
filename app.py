@@ -15,8 +15,9 @@ import civitai
 import gallery_fix
 import prompt_autocomplete
 import ui_style
+import upscaler
 from engine import (
-    Engine, HIRES_SCALE, InsufficientVram, SAMPLERS, VARIATION_COUNT,
+    Engine, InsufficientVram, SAMPLERS, VARIATION_COUNT,
     fit_size, list_checkpoints, load_preset,
 )
 
@@ -215,67 +216,58 @@ def on_pick_result(evt: gr.SelectData):
 
 
 def on_upscale(last, idx):
-    """選択中の生成結果を拡大し、img2img で細部を描き足す（倍率は engine.HIRES_SCALE）。"""
+    """選択中の画像を拡大する。
+
+    Real-ESRGAN を 1 回通すだけで、描き込みは足さない。
+    以前は img2img で描き直す方式 (Hires.fix) だったが、絵柄が動くため置き換えた。
+    engine.upscale 側の実装は残してあるので、戻したくなれば差し替えられる。
+    """
     if not last or not last.get("images"):
         yield gr.update(), "先に画像を生成してください。", gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
     src = images[i]
-    # seed は画像ごとに違うので seeds から取る。
-    # 履歴から作る状態には seeds しか無く、単数の seed を読むと KeyError になっていた。
     seeds = last.get("seeds") or []
     seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
-    if engine.current != last["ckpt"]:
-        load_or_alert(last["ckpt"])
+    yield gr.update(value=[], selected_index=None), "拡大しています...", gr.skip()
 
     q: queue.Queue = queue.Queue()
     res = {}
 
     def worker():
         try:
-            res["out"] = engine.upscale(
-                src, last["prompt"], last["negative"], last["cfg"], last["sampler"],
-                last["clip_skip"], seed,
-                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
-            )
+            res["out"] = upscaler.upscale(src, upscaler.SCALE)
         except Exception as e:  # noqa: BLE001
             res["err"] = e
         finally:
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    yield gr.update(value=[], selected_index=None), "高解像度化中... 0 step", gr.skip()
-    while (msg := q.get()) is not None:
-        s, total, imgs = msg
-        if imgs is not None:
-            yield imgs, f"高解像度化中... {s}/{total} step（途中プレビュー）", gr.skip()
-        else:
-            yield gr.update(), f"高解像度化中... {s}/{total} step", gr.skip()
+    q.get()
+
     if "err" in res:
         e = res["err"]
-        raise e if isinstance(e, gr.Error) else gr.Error(str(e))
+        raise gr.Error(str(e))
 
-    out, used_seed, perf = res["out"]
-    if out is None:  # 中止された
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip()
-        return
-
+    out = [res["out"]]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = OUT_DIR / f"{stamp}_{used_seed}_hires.png"
+    path = OUT_DIR / f"{stamp}_{seed}_x{upscaler.SCALE:g}.png"
+    # 元の生成条件を引き継いで書く。拡大後も履歴からたどれるようにするため
     _save_async(out, [path], {
-        "ckpt": last["ckpt"], "prompt": last["prompt"], "negative": last["negative"],
-        "cfg": last["cfg"], "sampler": last["sampler"], "clip_skip": last["clip_skip"],
-        "steps": last.get("steps"), "size": list(out[0].size), "seed": used_seed,
+        "ckpt": last.get("ckpt"), "prompt": last.get("prompt", ""),
+        "negative": last.get("negative", ""), "cfg": last.get("cfg"),
+        "sampler": last.get("sampler"), "clip_skip": last.get("clip_skip"),
+        "steps": last.get("steps"), "size": list(out[0].size), "seed": seed,
     })
     w, h = out[0].size
     info = (
-        f"高解像度化: {src.width}x{src.height} -> {w}x{h}  seed: {used_seed}\n"
-        f"[{perf}]"
+        f"拡大: {src.width}x{src.height} -> {w}x{h}  seed: {seed}\n"
+        f"file: {path.name}"
     )
-    # 拡大結果を起点にさらに高解像度化しないよう、状態は元のまま据え置く
-    yield gr.update(value=out, selected_index=None), info, gr.skip()
+    nxt = {**last, "images": out, "paths": [str(path)], "seeds": [seed]}
+    yield gr.update(value=out, selected_index=None), info, nxt
 
 
 # ---------- お気に入り ----------
@@ -682,7 +674,7 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                             f"少しだけ変える（{VARIATION_COUNT} 枚）", variant="secondary", scale=3
                         )
                         hires = gr.Button(
-                            f"解像度を {HIRES_SCALE:g} 倍", variant="secondary", scale=3
+                            f"解像度を {upscaler.SCALE:g} 倍", variant="secondary", scale=3
                         )
                         # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
                         favorite = gr.Button(
