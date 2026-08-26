@@ -338,7 +338,8 @@ def on_favorite(last, idx):
             in_fav.unlink()
         else:
             shutil.move(str(in_fav), str(in_out))
-        return f"お気に入りから外しました: {name}", gr.update(value=list_favorites())
+        # 成功したかは星の色で分かるので、メッセージは出さない
+        return gr.skip(), gr.update(value=list_favorites())
 
     # --- 追加 ---
     # 保存は裏で走っているので、書き終わるまで少しだけ待つ
@@ -351,7 +352,7 @@ def on_favorite(last, idx):
         shutil.move(str(in_out), str(in_fav))
     else:  # 保存が間に合わない場合はメモリ上の画像から直接書く
         images[i].save(in_fav, compress_level=1)
-    return f"お気に入りに追加しました: {name}", gr.update(value=list_favorites())
+    return gr.skip(), gr.update(value=list_favorites())
 
 
 def on_refresh_favorites():
@@ -436,8 +437,13 @@ def list_history():
 
 
 def on_refresh_history():
+    """一覧を更新し、選択を解除する。
+
+    第 4 の戻り値は生成情報欄。ここは生成結果の表示と共用なので、
+    せっかく出た結果を消さないよう触らない（gr.skip）。
+    """
     files = list_history()
-    return gr.update(value=files), f"{len(files)} 枚", None, "画像を選ぶと操作できます。"
+    return gr.update(value=files), f"{len(files)} 枚", None, gr.skip()
 
 
 def on_refresh_history_keep():
@@ -479,10 +485,9 @@ def on_pick_history(evt: gr.SelectData):
             "size": list(img.size), "no_meta": True,
         }
         return state, (
-            f"**{path.name}**（{img.width}x{img.height}）\n\n"
-            "この画像には生成条件が記録されていません。今回の更新より前に作られた画像です。\n"
-            "**お気に入りへの移動はできます**が、「少しだけ変える」「高解像度化」は"
-            "元のプロンプトや seed が分からないため実行できません。"
+            f"{path.name}  size: {img.width}x{img.height}\n"
+            "生成条件が記録されていない画像です（この機能より前に作られたもの）。\n"
+            "お気に入りには入れられますが、少しだけ変える・解像度を上げるは実行できません。"
         )
 
     state = {
@@ -492,12 +497,14 @@ def on_pick_history(evt: gr.SelectData):
         "sampler": meta.get("sampler", "euler_a"), "clip_skip": meta.get("clip_skip", 2),
         "steps": meta.get("steps", 28), "size": meta.get("size", list(img.size)),
     }
+    size = meta.get("size") or list(img.size)
+    # 生成直後に出る表示と語順を揃えておくと、見比べたときに読みやすい
     return state, (
-        f"**{path.name}**（{img.width}x{img.height}）\n\n"
-        f"seed: `{meta.get('seed')}` / Steps: {meta.get('steps')} / "
-        f"CFG: {meta.get('cfg')} / {meta.get('sampler')} / Clip Skip: {meta.get('clip_skip')}\n\n"
-        f"モデル: `{meta.get('ckpt')}`\n\n"
-        f"プロンプト: {meta.get('prompt', '')}"
+        f"seed: {meta.get('seed')}  size: {size[0]}x{size[1]}  "
+        f"steps: {meta.get('steps')}  cfg: {meta.get('cfg')}  "
+        f"{meta.get('sampler')}  clip skip: {meta.get('clip_skip')}\n"
+        f"model: {meta.get('ckpt')}  file: {path.name}\n"
+        f"prompt: {meta.get('prompt', '')}"
     )
 
 
@@ -665,7 +672,6 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                                 label="生成履歴（クリックで選択）", columns=3, height=620,
                                 object_fit="contain",
                             )
-                            hist_detail = gr.Markdown("画像を選ぶと操作できます。")
 
                     with gr.Row():
                         variation = gr.Button(
@@ -679,7 +685,7 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                             "", variant="secondary", scale=1,
                             elem_classes=FAV_CLASS,
                         )
-                    info = gr.Textbox(label="生成情報", interactive=False, lines=2)
+                    info = gr.Textbox(label="生成情報", interactive=False, lines=3)
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
@@ -782,9 +788,9 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
 
     hist_tab.select(
         lambda: (*on_refresh_history(), "history"), None,
-        [hist_gallery, hist_count, hist_sel, hist_detail, which_out],
+        [hist_gallery, hist_count, hist_sel, info, which_out],
     ).then(fav_button_state, *_fav_args)
-    hist_gallery.select(on_pick_history, None, [hist_sel, hist_detail]).then(
+    hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
         fav_button_state, *_fav_args
     )
     hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
@@ -796,7 +802,7 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
         return gr.Tabs(selected="current"), "current"
 
     _refresh_hist = (on_refresh_history, None,
-                     [hist_gallery, hist_count, hist_sel, hist_detail])
+                     [hist_gallery, hist_count, hist_sel, info])
 
     variation.click(
         on_variations_target, [which_out, last_gen, picked, hist_sel],
