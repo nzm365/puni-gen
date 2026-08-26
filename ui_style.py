@@ -56,6 +56,16 @@ gradio-app {
     background-position: center;
     background-size: 20px 20px;
     min-width: 46px;
+    /* ラベルが空だと、display:flex のボタンは中身が無いぶん高さ 14px まで潰れる
+       （文字ありのボタンは 36px）。line-height も min-height も期待どおり効かないので、
+       疑似要素で文字と同じ高さの中身を作って押し広げる。これが一番確実だった */
+}
+.gradio-container button.fav-btn::before {
+    content: "";
+    display: block;
+    /* 文字ありボタンの行の高さ（line-height 24px）と揃える。
+       24px + 上下 padding 8px x2 = 36px で他のボタンと同じ高さになる */
+    height: 24px;
 }
 .gradio-container button.fav-btn.on {
     background-image: url("data:image/svg+xml,__STAR_ON__");
