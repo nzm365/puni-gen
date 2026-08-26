@@ -1,0 +1,34 @@
+# 直接依存だけを書く「入力」ファイル。
+# ここを編集したら setup.bat の隣にある手順でロックを作り直す:
+#
+#   uv pip compile requirements.in -o requirements.lock ^
+#     --index-strategy unsafe-best-match ^
+#     --extra-index-url https://download.pytorch.org/whl/cu128
+#
+# 実際にインストールされるのは requirements.lock の方で、そちらは推移的依存まで
+# すべてバージョンが固定されている。いつ・どの環境で setup.bat を実行しても
+# 同じ構成になるようにするため。
+
+# RTX 40 / 50 系に必要な CUDA 12.8 ビルド。別インデックスから入る。
+# バージョンを明示しないと汎用ビルド (+cu128 が付かないもの) に解決されてしまう
+torch==2.11.0
+torchvision==0.26.0
+
+# 推論本体
+diffusers==0.40.0
+transformers==5.15.1
+accelerate==1.14.0
+safetensors==0.8.0
+
+# 画面
+gradio==6.25.0
+pillow==12.3.0
+
+# 拡大用モデル (Real-ESRGAN) の読み込み
+spandrel==0.4.2
+
+# プロンプトの重み付き構文と 77 トークン超の解釈。
+# compel 本体は notebook (Jupyter 一式) を依存に宣言しているが実行時には読まない。
+# ロックに Jupyter 一式を持ち込みたくないので、ここには pyparsing だけを書き、
+# compel 本体は setup.bat が --no-deps で入れる
+pyparsing==3.3.2

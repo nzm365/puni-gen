@@ -1,9 +1,9 @@
 @echo off
-chcp 65001 >nul
+rem ‚±‚Ìƒtƒ@ƒCƒ‹‚Í CP932 (Shift_JIS) ‚Å•Û‘¶‚·‚é‚±‚Æisetup.bat ‚Ì’‹L‚ğQÆjB
 set "PYTHONUTF8=1"
 cd /d "%~dp0"
 if not exist .venv\Scripts\python.exe (
-    echo .venv ãŒã‚ã‚Šã¾ã›ã‚“ã€‚å…ˆã« setup.bat ã‚’å®Ÿè¡Œã—ã¦ãã ã•ã„ã€‚
+    echo .venv ‚ª‚ ‚è‚Ü‚¹‚ñBæ‚É setup.bat ‚ğÀs‚µ‚Ä‚­‚¾‚³‚¢B
     pause
     exit /b 1
 )

@@ -14,8 +14,10 @@ from PIL import Image, PngImagePlugin
 import civitai
 import gallery_fix
 import prompt_autocomplete
+import ui_style
+import upscaler
 from engine import (
-    Engine, HIRES_SCALE, InsufficientVram, SAMPLERS, VARIATION_COUNT,
+    Engine, InsufficientVram, SAMPLERS, VARIATION_COUNT,
     fit_size, list_checkpoints, load_preset,
 )
 
@@ -214,66 +216,93 @@ def on_pick_result(evt: gr.SelectData):
 
 
 def on_upscale(last, idx):
-    """選択中の生成結果を拡大し、img2img で細部を描き足す（倍率は engine.HIRES_SCALE）。"""
+    """選択中の画像を拡大する。
+
+    Real-ESRGAN を 1 回通すだけで、描き込みは足さない。
+    以前は img2img で描き直す方式 (Hires.fix) だったが、絵柄が動くため置き換えた。
+    engine.upscale 側の実装は残してあるので、戻したくなれば差し替えられる。
+    """
     if not last or not last.get("images"):
         yield gr.update(), "先に画像を生成してください。", gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
     src = images[i]
+    seeds = last.get("seeds") or []
+    seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
-    if engine.current != last["ckpt"]:
-        load_or_alert(last["ckpt"])
+    yield gr.update(value=[], selected_index=None), "拡大しています...", gr.skip()
 
     q: queue.Queue = queue.Queue()
     res = {}
 
     def worker():
         try:
-            res["out"] = engine.upscale(
-                src, last["prompt"], last["negative"], last["cfg"], last["sampler"],
-                last["clip_skip"], last["seed"],
-                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
-            )
+            res["out"] = upscaler.upscale(src, upscaler.SCALE)
         except Exception as e:  # noqa: BLE001
             res["err"] = e
         finally:
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    yield gr.update(value=[], selected_index=None), "高解像度化中... 0 step", gr.skip()
-    while (msg := q.get()) is not None:
-        s, total, imgs = msg
-        if imgs is not None:
-            yield imgs, f"高解像度化中... {s}/{total} step（途中プレビュー）", gr.skip()
-        else:
-            yield gr.update(), f"高解像度化中... {s}/{total} step", gr.skip()
+    q.get()
+
     if "err" in res:
         e = res["err"]
-        raise e if isinstance(e, gr.Error) else gr.Error(str(e))
+        raise gr.Error(str(e))
 
-    out, used_seed, perf = res["out"]
-    if out is None:  # 中止された
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip()
-        return
-
+    out = [res["out"]]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = OUT_DIR / f"{stamp}_{used_seed}_hires.png"
+    path = OUT_DIR / f"{stamp}_{seed}_x{upscaler.SCALE:g}.png"
+    # 元の生成条件を引き継いで書く。拡大後も履歴からたどれるようにするため
     _save_async(out, [path], {
-        "ckpt": last["ckpt"], "prompt": last["prompt"], "negative": last["negative"],
-        "cfg": last["cfg"], "sampler": last["sampler"], "clip_skip": last["clip_skip"],
-        "steps": last.get("steps"), "size": list(out[0].size), "seed": used_seed,
+        "ckpt": last.get("ckpt"), "prompt": last.get("prompt", ""),
+        "negative": last.get("negative", ""), "cfg": last.get("cfg"),
+        "sampler": last.get("sampler"), "clip_skip": last.get("clip_skip"),
+        "steps": last.get("steps"), "size": list(out[0].size), "seed": seed,
     })
     w, h = out[0].size
     info = (
-        f"高解像度化: {src.width}x{src.height} -> {w}x{h}  seed: {used_seed}\n"
-        f"[{perf}]"
+        f"拡大: {src.width}x{src.height} -> {w}x{h}  seed: {seed}\n"
+        f"file: {path.name}"
     )
-    # 拡大結果を起点にさらに高解像度化しないよう、状態は元のまま据え置く
-    yield gr.update(value=out, selected_index=None), info, gr.skip()
+    nxt = {**last, "images": out, "paths": [str(path)], "seeds": [seed]}
+    yield gr.update(value=out, selected_index=None), info, nxt
 
 
 # ---------- お気に入り ----------
+# 星はフォントに任せると字形が環境ごとに変わって見栄えがしない。
+# Gradio のボタンはラベルの HTML をエスケープするので、SVG を直接は埋め込めない。
+# そこで elem_classes で状態を伝え、実際の星は CSS の背景画像として描く
+# （ui_style.py 側で定義）。ラベル自体は空にしておく。
+FAV_CLASS = "fav-btn"          # 未登録
+FAV_CLASS_DONE = "fav-btn on"  # 登録済み
+
+
+def _fav_name(state, idx) -> str | None:
+    """選択中の画像のファイル名を返す（お気に入りの判定と移動に使う）。"""
+    if not state or not state.get("paths"):
+        return None
+    i = 0 if idx is None else min(int(idx), len(state["paths"]) - 1)
+    return Path(state["paths"][i]).name
+
+
+def _fav_button(state, idx):
+    """選択中の画像がお気に入り済みかどうかで、ボタンの見た目を返す。
+
+    済みのときは primary（塗りつぶし）にして、ラベルにも印を付ける。
+    色だけだと分かりにくい環境があるので、両方で示す。
+    押すと解除できるので、済みでも押せる状態のままにする。
+    """
+    name = _fav_name(state, idx)
+    on = bool(name and (FAV_DIR / name).exists())
+    return gr.update(
+        variant="primary" if on else "secondary",
+        elem_classes=FAV_CLASS_DONE if on else FAV_CLASS,
+        interactive=True,
+    )
+
+
 def list_favorites():
     """お気に入りフォルダの画像を新しい順で返す。"""
     if not FAV_DIR.exists():
@@ -283,29 +312,43 @@ def list_favorites():
 
 
 def on_favorite(last, idx):
-    """選択中の画像を outputs から favorites へ移す。"""
+    """選択中の画像のお気に入り状態を切り替える。
+
+    追加は outputs から favorites への移動、解除はその逆。
+    元の場所へ戻すので、解除しても画像は消えず履歴に並ぶ。
+    """
     if not last or not last.get("images"):
         return "先に画像を生成してください。", gr.update()
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
     FAV_DIR.mkdir(exist_ok=True)
 
-    src = Path(last["paths"][i])
-    dst = FAV_DIR / src.name
-    if dst.exists():
-        return f"すでにお気に入りにあります: {dst.name}", gr.update()
+    name = Path(last["paths"][i]).name
+    in_out = OUT_DIR / name
+    in_fav = FAV_DIR / name
 
+    # --- 解除 ---
+    if in_fav.exists():
+        if in_out.exists():
+            # 同名が両方にある（手で戻した等）。favorites 側だけ消して整合させる
+            in_fav.unlink()
+        else:
+            shutil.move(str(in_fav), str(in_out))
+        # 成功したかは星の色で分かるので、メッセージは出さない
+        return gr.skip(), gr.update(value=list_favorites())
+
+    # --- 追加 ---
     # 保存は裏で走っているので、書き終わるまで少しだけ待つ
     for _ in range(20):
-        if src.exists():
+        if in_out.exists():
             break
         time.sleep(0.1)
 
-    if src.exists():
-        shutil.move(str(src), str(dst))
+    if in_out.exists():
+        shutil.move(str(in_out), str(in_fav))
     else:  # 保存が間に合わない場合はメモリ上の画像から直接書く
-        images[i].save(dst, compress_level=1)
-    return f"お気に入りに移動しました: {dst.name}", gr.update(value=list_favorites())
+        images[i].save(in_fav, compress_level=1)
+    return gr.skip(), gr.update(value=list_favorites())
 
 
 def on_refresh_favorites():
@@ -390,8 +433,24 @@ def list_history():
 
 
 def on_refresh_history():
+    """一覧を更新し、選択を解除する。
+
+    第 4 の戻り値は生成情報欄。ここは生成結果の表示と共用なので、
+    せっかく出た結果を消さないよう触らない（gr.skip）。
+    """
     files = list_history()
-    return gr.update(value=files), f"{len(files)} 枚", None, "画像を選ぶと操作できます。"
+    return gr.update(value=files), f"{len(files)} 枚", None, gr.skip()
+
+
+def on_refresh_history_keep():
+    """一覧だけ更新し、選択中の画像は保つ。
+
+    お気に入りの追加・解除の直後に使う。通常の更新は選択を解除するが、
+    それだと解除した直後にもう一度押せず、「履歴から画像を選んでください」と
+    出てしまう（実際にそうなっていた）。
+    """
+    files = list_history()
+    return gr.update(value=files), f"{len(files)} 枚"
 
 
 def on_pick_history(evt: gr.SelectData):
@@ -422,10 +481,9 @@ def on_pick_history(evt: gr.SelectData):
             "size": list(img.size), "no_meta": True,
         }
         return state, (
-            f"**{path.name}**（{img.width}x{img.height}）\n\n"
-            "この画像には生成条件が記録されていません。今回の更新より前に作られた画像です。\n"
-            "**お気に入りへの移動はできます**が、「少しだけ変える」「高解像度化」は"
-            "元のプロンプトや seed が分からないため実行できません。"
+            f"{path.name}  size: {img.width}x{img.height}\n"
+            "生成条件が記録されていない画像です（この機能より前に作られたもの）。\n"
+            "お気に入りには入れられますが、少しだけ変える・解像度を上げるは実行できません。"
         )
 
     state = {
@@ -435,12 +493,14 @@ def on_pick_history(evt: gr.SelectData):
         "sampler": meta.get("sampler", "euler_a"), "clip_skip": meta.get("clip_skip", 2),
         "steps": meta.get("steps", 28), "size": meta.get("size", list(img.size)),
     }
+    size = meta.get("size") or list(img.size)
+    # 生成直後に出る表示と語順を揃えておくと、見比べたときに読みやすい
     return state, (
-        f"**{path.name}**（{img.width}x{img.height}）\n\n"
-        f"seed: `{meta.get('seed')}` / Steps: {meta.get('steps')} / "
-        f"CFG: {meta.get('cfg')} / {meta.get('sampler')} / Clip Skip: {meta.get('clip_skip')}\n\n"
-        f"モデル: `{meta.get('ckpt')}`\n\n"
-        f"プロンプト: {meta.get('prompt', '')}"
+        f"seed: {meta.get('seed')}  size: {size[0]}x{size[1]}  "
+        f"steps: {meta.get('steps')}  cfg: {meta.get('cfg')}  "
+        f"{meta.get('sampler')}  clip skip: {meta.get('clip_skip')}\n"
+        f"model: {meta.get('ckpt')}  file: {path.name}\n"
+        f"prompt: {meta.get('prompt', '')}"
     )
 
 
@@ -454,20 +514,53 @@ def _need_meta(state):
     return None
 
 
-def on_hist_variations(state, idx):
-    msg = _need_meta(state)
+# ---------- 操作対象の切り替え ----------
+# ボタンは 1 組しか置かない。押されたとき、右カラムでどちらのサブタブを開いているかで
+# 「今回の生成結果」と「履歴で選んだ画像」のどちらに作用するかを決める。
+def _target(which, last, picked, hist_sel):
+    """(状態, 番号, エラーメッセージ) を返す。"""
+    if which == "history":
+        if not hist_sel:
+            return None, 0, "履歴から画像を選んでください。"
+        if hist_sel.get("no_meta"):
+            return None, 0, ("この画像には生成条件が記録されていないため実行できません"
+                             "（この機能より前に作られた画像です）。")
+        return hist_sel, 0, None
+    if not last or not last.get("images"):
+        return None, 0, "先に画像を生成してください。"
+    return last, picked, None
+
+
+def fav_button_state(which, last, picked, hist_sel):
+    """いま操作対象になっている画像で、お気に入りボタンの見た目を決める。"""
+    if which == "history":
+        return _fav_button(hist_sel, 0)
+    return _fav_button(last, picked)
+
+
+def on_variations_target(which, last, picked, hist_sel):
+    state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
         yield gr.update(), msg, gr.skip()
         return
     yield from on_variations(state, idx)
 
 
-def on_hist_upscale(state, idx):
-    msg = _need_meta(state)
+def on_upscale_target(which, last, picked, hist_sel):
+    state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
         yield gr.update(), msg, gr.skip()
         return
     yield from on_upscale(state, idx)
+
+
+def on_favorite_target(which, last, picked, hist_sel):
+    # お気に入りは生成条件が要らないので no_meta でも通す
+    if which == "history":
+        if not hist_sel:
+            return "履歴から画像を選んでください。", gr.update()
+        return on_favorite(hist_sel, 0)
+    return on_favorite(last, picked)
 
 
 # ---------- モデルを追加（Civitai） ----------
@@ -562,58 +655,41 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                             seed = gr.Number(-1, label="Seed (-1 でランダム)", precision=0)
 
                 with gr.Column(scale=1):
-                    gallery = gr.Gallery(
-                        label="結果", columns=2, height=760, object_fit="contain",
-                    )
+                    # 今回の生成結果と過去の履歴を、同じ場所でサブタブとして切り替える。
+                    # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
+                    with gr.Tabs() as out_tabs:
+                        with gr.Tab("今回の結果", id="current") as cur_tab:
+                            gallery = gr.Gallery(
+                                label="結果", columns=2, height=680, object_fit="contain",
+                            )
+                        with gr.Tab("履歴", id="history") as hist_tab:
+                            hist_count = gr.Markdown("")
+                            hist_gallery = gr.Gallery(
+                                label="生成履歴（クリックで選択）", columns=3, height=620,
+                                object_fit="contain",
+                            )
+
                     with gr.Row():
                         variation = gr.Button(
-                            f"この絵を少しだけ変える（{VARIATION_COUNT} 枚）", variant="secondary", scale=2
+                            f"少しだけ変える（{VARIATION_COUNT} 枚）", variant="secondary", scale=3
                         )
-                        favorite = gr.Button("★ お気に入り", variant="secondary", scale=1)
-                    hires = gr.Button(
-                        f"選択した画像を {HIRES_SCALE:g} 倍に高解像度化", variant="secondary"
-                    )
-                    info = gr.Textbox(label="生成情報", interactive=False, lines=2)
+                        hires = gr.Button(
+                            f"解像度を {upscaler.SCALE:g} 倍", variant="secondary", scale=3
+                        )
+                        # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
+                        favorite = gr.Button(
+                            "", variant="secondary", scale=1,
+                            elem_classes=FAV_CLASS,
+                        )
+                    info = gr.Textbox(label="生成情報", interactive=False, lines=3)
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
                     last_gen = gr.State(None)
                     picked = gr.State(None)
-
-        with gr.Tab("生成履歴", id="history") as hist_tab:
-            gr.Markdown(
-                "`outputs/` に保存された画像を新しい順に表示します"
-                "（このタブを開くたびに自動で最新になります）。"
-                "画像を選ぶと、生成タブに戻らずにそのまま操作できます。"
-            )
-            hist_count = gr.Markdown("")
-
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=1):
-                    hist_gallery = gr.Gallery(
-                        label="生成履歴（クリックで選択）", columns=4, height=640,
-                        object_fit="contain",
-                    )
-                with gr.Column(scale=1):
-                    hist_detail = gr.Markdown("画像を選ぶと操作できます。")
-                    with gr.Row():
-                        hist_variation = gr.Button(
-                            f"この絵を少しだけ変える（{VARIATION_COUNT} 枚）",
-                            variant="secondary", scale=2,
-                        )
-                        hist_favorite = gr.Button("★ お気に入り", variant="secondary", scale=1)
-                    hist_hires = gr.Button(
-                        f"選択した画像を {HIRES_SCALE:g} 倍に高解像度化", variant="secondary"
-                    )
-                    gr.Markdown(
-                        "「少しだけ変える」「高解像度化」を押すと**生成タブに移動**して"
-                        "結果が表示されます。そのまま続けて操作できます。"
-                    )
-                    hist_info = gr.Textbox(label="情報", interactive=False, lines=2)
-
-            # 選択中の画像とその生成条件（生成タブの last_gen と同じ形）
-            hist_sel = gr.State(None)
-            hist_idx = gr.State(0)
+                    # 履歴側で選ばれている画像の条件と、いま開いているサブタブ
+                    hist_sel = gr.State(None)
+                    which_out = gr.State("current")
 
         with gr.Tab("お気に入り", id="favorites") as fav_tab:
             gr.Markdown(
@@ -662,6 +738,9 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
             cands_state = gr.State([])
             sel_state = gr.State(None)
 
+    # お気に入りボタンの表示更新は多くの操作の後に走るので、引数をまとめておく
+    _fav_args = ([which_out, last_gen, picked, hist_sel], favorite)
+
     preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
     model_dd.change(on_model_change, model_dd, preset_outputs)
     refresh.click(lambda: gr.update(choices=list_checkpoints()), None, model_dd)
@@ -677,8 +756,10 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
         [model_dd, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
          in_image, strength],
         [gallery, info, last_gen],
-    ).then(lambda: None, None, picked)
-    gallery.select(on_pick_result, None, picked)
+    ).then(lambda: None, None, picked).then(fav_button_state, *_fav_args)
+    gallery.select(on_pick_result, None, picked).then(
+        fav_button_state, *_fav_args
+    )
     # 拡大表示を閉じたらブラウザのフルスクリーンも解除する。
     # Gallery 側は fullscreen を解除しないため（frontend に exitFullscreen が無い）、
     # 閉じても全画面の格子表示が残り、元の画面に戻れなくなる。
@@ -690,42 +771,59 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
     gallery.preview_close(None, None, None, js=_EXIT_FS)
     fav_gallery.preview_close(None, None, None, js=_EXIT_FS)
     # 生成・変分・高解像度化のたびに選択番号を捨てる（結果が入れ替わるため）
-    hires.click(on_upscale, [last_gen, picked], [gallery, info, last_gen]).then(
-        lambda: None, None, picked
-    )
-    variation.click(on_variations, [last_gen, picked], [gallery, info, last_gen]).then(
-        lambda: None, None, picked
-    )
-    favorite.click(on_favorite, [last_gen, picked], [info, fav_gallery])
     # タブを開いたときに自動で読み直す（再読み込みボタンは置かない）。
     # 生成やお気に入り移動でフォルダの中身が変わるので、開くたびに最新にする
-    hist_tab.select(on_refresh_history, None,
-                    [hist_gallery, hist_count, hist_sel, hist_detail])
-    demo.load(on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail])
-    hist_gallery.select(on_pick_history, None, [hist_sel, hist_detail])
-    hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
-    # 生成タブ用のハンドラをそのまま使う（state の形を合わせてある）。
-    # 実行後は履歴が増えるので一覧も更新する
-    # 履歴からの再生成は、結果を生成タブのギャラリーに出して画面ごと移動する。
-    # 履歴タブに結果表示を二重に持たず、移動先でそのまま続けて操作できるようにするため。
-    # last_gen も更新するので、生成タブ側のボタンがそのまま効く。
-    def _to_gen():
-        return gr.Tabs(selected="gen")
+    # --- 右カラムのサブタブ ---
+    # どちらを開いているかを覚え、ボタンはその側の画像に作用する
+    # どちらのサブタブを開いているかを覚える。
+    # Tabs の select が返す evt.value はラベル文字列なので、id と取り違えないよう
+    # タブごとに定数を返す形にしている。
+    cur_tab.select(lambda: "current", None, which_out).then(
+        fav_button_state, [which_out, last_gen, picked, hist_sel], favorite
+    )
 
-    hist_variation.click(
-        on_hist_variations, [hist_sel, hist_idx], [gallery, info, last_gen]
-    ).then(_to_gen, None, tabs).then(
-        on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail]
+    hist_tab.select(
+        lambda: (*on_refresh_history(), "history"), None,
+        [hist_gallery, hist_count, hist_sel, info, which_out],
+    ).then(fav_button_state, *_fav_args)
+    hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
+        fav_button_state, *_fav_args
     )
-    hist_hires.click(
-        on_hist_upscale, [hist_sel, hist_idx], [gallery, info, last_gen]
-    ).then(_to_gen, None, tabs).then(
-        on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail]
+    hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
+
+    # --- 操作ボタン（1 組で両方のサブタブを兼ねる）---
+    # 再生成したら「今回の結果」へ切り替え、履歴一覧も更新する。
+    # 結果の表示場所を 1 か所に保ちつつ、履歴に新しい画像を反映させるため。
+    def _to_current():
+        return gr.Tabs(selected="current"), "current"
+
+    _refresh_hist = (on_refresh_history, None,
+                     [hist_gallery, hist_count, hist_sel, info])
+
+    variation.click(
+        on_variations_target, [which_out, last_gen, picked, hist_sel],
+        [gallery, info, last_gen],
+    ).then(_to_current, None, [out_tabs, which_out]).then(
+        lambda: None, None, picked
+    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+
+    hires.click(
+        on_upscale_target, [which_out, last_gen, picked, hist_sel],
+        [gallery, info, last_gen],
+    ).then(_to_current, None, [out_tabs, which_out]).then(
+        lambda: None, None, picked
+    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+
+    # お気に入りは画像が増えないのでサブタブは切り替えない
+    # 追加・解除で outputs と favorites の間を移動するので一覧は更新するが、
+    # 選択は保つ（続けて押し直せるようにするため）
+    favorite.click(
+        on_favorite_target, [which_out, last_gen, picked, hist_sel],
+        [info, fav_gallery],
+    ).then(fav_button_state, *_fav_args).then(
+        on_refresh_history_keep, None, [hist_gallery, hist_count]
     )
-    # お気に入りは画像が増えるわけではないので履歴タブに留まる（続けて選別しやすい）
-    hist_favorite.click(
-        on_favorite, [hist_sel, hist_idx], [hist_info, fav_gallery]
-    ).then(on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail])
+
     fav_tab.select(on_refresh_favorites, None, [fav_gallery, fav_count])
     demo.load(on_refresh_favorites, None, [fav_gallery, fav_count])
     # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
@@ -736,6 +834,7 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
 demo.launch(
     inbrowser=True,
     head=prompt_autocomplete.build_head(emb_tokens) + gallery_fix.build_head(),
+    css=ui_style.build_css(),
     # Gradio は自分が作ったファイル以外の配信を 403 で拒む。検索結果のサムネイルは
     # civitai.py が .thumb_cache に自前で保存しているため、明示的に許可しないと
     # ギャラリーが空のまま表示される

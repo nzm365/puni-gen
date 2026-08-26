@@ -1,33 +1,48 @@
 @echo off
-chcp 65001 >nul
+rem ‚±‚Ìƒtƒ@ƒCƒ‹‚Í CP932 (Shift_JIS) ‚Å•Û‘¶‚·‚é‚±‚ÆB
+rem UTF-8 + chcp 65001 ‚¾‚ÆAcmd ‚ªs‚Ì“Ç‚İæ‚èˆÊ’u‚ğ‘½ƒoƒCƒg•¶š‚Ì“r’†‚Å
+rem Œ©¸‚¢A“ú–{ŒêƒRƒƒ“ƒg‚Ì“r’†‚©‚ç–½—ß‚Æ‚µ‚ÄÀs‚³‚ê‚Ä‚µ‚Ü‚¤
+rem iÀÛ‚É '‚«‚Ìè‡‚Í' is not recognized... ‚Æ‚¢‚¤ƒGƒ‰[‚ªo‚½jB
 setlocal
 set "PYTHONUTF8=1"
 cd /d "%~dp0"
 
-echo [1/4] uv ã‚’ç¢ºèªä¸­...
+echo [1/4] uv ‚ğŠm”F’†...
 where uv >nul 2>nul
 if errorlevel 1 (
-    echo uv ãŒè¦‹ã¤ã‹ã‚Šã¾ã›ã‚“ã€‚ãƒ¦ãƒ¼ã‚¶ãƒ¼é ˜åŸŸã«ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ã—ã¾ã™ï¼ˆç®¡ç†è€…æ¨©é™ä¸è¦ï¼‰
+    echo uv ‚ªŒ©‚Â‚©‚è‚Ü‚¹‚ñBƒ†[ƒU[—Ìˆæ‚ÉƒCƒ“ƒXƒg[ƒ‹‚µ‚Ü‚·iŠÇ—ÒŒ ŒÀ•s—vj
     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
     set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 )
 
-echo [2/4] Python 3.12 ã‚’ãƒ—ãƒ­ã‚¸ã‚§ã‚¯ãƒˆå°‚ç”¨ã«å–å¾—...
+echo [2/4] Python 3.12 ‚ğƒvƒƒWƒFƒNƒgê—p‚Éæ“¾...
 uv python install 3.12
 
-echo [3/4] ä»®æƒ³ç’°å¢ƒ .venv ã‚’ä½œæˆ...
+echo [3/4] ‰¼‘zŠÂ‹« .venv ‚ğì¬...
 uv venv --python 3.12 .venv
 
-echo [4/4] ä¾å­˜ãƒ‘ãƒƒã‚±ãƒ¼ã‚¸ã‚’ã‚¤ãƒ³ã‚¹ãƒˆãƒ¼ãƒ«ï¼ˆtorch ã¯ CUDA 12.8 ãƒ“ãƒ«ãƒ‰ / RTX 40ãƒ»50 ç³»å¯¾å¿œï¼‰...
-uv pip install --python .venv torch torchvision --index-url https://download.pytorch.org/whl/cu128
-uv pip install --python .venv -r requirements.txt
-rem compel ã¯ notebook (Jupyter ä¸€å¼) ã‚’ä¾å­˜ã«å®£è¨€ã—ã¦ã„ã‚‹ãŒå®Ÿè¡Œæ™‚ã«ã¯ä½¿ã‚ãªã„ãŸã‚ã€
-rem --no-deps ã§æœ¬ä½“ã ã‘å…¥ã‚Œã‚‹ï¼ˆå¿…è¦ãª pyparsing ã¯ requirements.txt å´ã§å°å…¥æ¸ˆã¿ï¼‰
-uv pip install --python .venv --no-deps compel
+echo [4/4] ˆË‘¶ƒpƒbƒP[ƒW‚ğƒCƒ“ƒXƒg[ƒ‹itorch ‚Í CUDA 12.8 ƒrƒ‹ƒh / RTX 40E50 Œn‘Î‰j...
+rem requirements.lock ‚Í„ˆÚ“IˆË‘¶‚Ü‚Å‘S‚Äƒo[ƒWƒ‡ƒ“‚ğŒÅ’è‚µ‚Ä‚ ‚éB
+rem ‚±‚ê‚ğg‚¤‚±‚Æ‚ÅA‚¢‚ÂE‚Ç‚ÌŠÂ‹«‚ÅÀs‚µ‚Ä‚à“¯‚¶\¬‚É‚È‚éB
+rem ˆË‘¶‚ğ•Ï‚¦‚½‚¢‚Æ‚«‚Ìè‡‚Í README ‚ÌuˆË‘¶ƒpƒbƒP[ƒW‚ğXV‚·‚év‚ğQÆB
+uv pip install --python .venv -r requirements.lock --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu128
+if errorlevel 1 goto :failed
+rem compel ‚Í notebook (Jupyter ˆê®) ‚ğˆË‘¶‚ÉéŒ¾‚µ‚Ä‚¢‚é‚ªÀs‚É‚Íg‚í‚È‚¢‚½‚ßA
+rem --no-deps ‚Å–{‘Ì‚¾‚¯“ü‚ê‚éi•K—v‚È pyparsing ‚ÍƒƒbƒN‘¤‚Å“±“üÏ‚İj
+uv pip install --python .venv --no-deps compel==2.4.0
+if errorlevel 1 goto :failed
 
 echo.
-echo ã‚»ãƒƒãƒˆã‚¢ãƒƒãƒ—å®Œäº†ã€‚GPU èªè­˜ã‚’ç¢ºèªã—ã¾ã™:
+echo ƒZƒbƒgƒAƒbƒvŠ®—¹BGPU ”F¯‚ğŠm”F‚µ‚Ü‚·:
 .venv\Scripts\python.exe -c "import torch; print('CUDA:', torch.cuda.is_available(), '/', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
 echo.
-echo æ¬¡ã¯ models\checkpoints ã«ãƒ¢ãƒ‡ãƒ«ã€models\embeddings ã«åŸ‹ã‚è¾¼ã¿ã‚’ç½®ã„ã¦ start.bat ã‚’å®Ÿè¡Œã—ã¦ãã ã•ã„ã€‚
+echo Ÿ‚Í models\checkpoints ‚Éƒ‚ƒfƒ‹Amodels\embeddings ‚É–„‚ß‚İ‚ğ’u‚¢‚Ä start.bat ‚ğÀs‚µ‚Ä‚­‚¾‚³‚¢B
 pause
+exit /b 0
+
+:failed
+echo.
+echo ƒCƒ“ƒXƒg[ƒ‹‚É¸”s‚µ‚Ü‚µ‚½Bƒlƒbƒgƒ[ƒNÚ‘±‚ğŠm”F‚µ‚ÄA‚à‚¤ˆê“xÀs‚µ‚Ä‚­‚¾‚³‚¢B
+echo ŒJ‚è•Ô‚µ¸”s‚·‚éê‡‚Í .venv ƒtƒHƒ‹ƒ_‚ğíœ‚µ‚Ä‚©‚çÄÀs‚µ‚Ä‚­‚¾‚³‚¢B
+pause
+exit /b 1

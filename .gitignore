@@ -6,8 +6,11 @@ __pycache__/
 # モデル・埋め込み（巨大、git 管理しない。フォルダだけ残す）
 models/checkpoints/*
 models/embeddings/*
+# 拡大用モデル。初回起動時に自動で取得するので共有しない
+models/upscaler/*
 !models/checkpoints/.keep
 !models/embeddings/.keep
+!models/upscaler/.keep
 
 # 生成結果
 outputs/*
@@ -46,3 +49,8 @@ desktop.ini
 *.ckpt
 *.pt
 *.bin
+
+# Claude Code の権限設定。ローカルの絶対パスやセッション ID を含み、
+# 他の環境では意味を持たないため共有しない
+.claude/settings.json
+.claude/settings.local.json
