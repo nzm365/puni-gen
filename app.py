@@ -14,6 +14,7 @@ from PIL import Image, PngImagePlugin
 import civitai
 import gallery_fix
 import prompt_autocomplete
+import ui_style
 from engine import (
     Engine, HIRES_SCALE, InsufficientVram, SAMPLERS, VARIATION_COUNT,
     fit_size, list_checkpoints, load_preset,
@@ -787,6 +788,7 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
 demo.launch(
     inbrowser=True,
     head=prompt_autocomplete.build_head(emb_tokens) + gallery_fix.build_head(),
+    css=ui_style.build_css(),
     # Gradio は自分が作ったファイル以外の配信を 403 で拒む。検索結果のサムネイルは
     # civitai.py が .thumb_cache に自前で保存しているため、明示的に許可しないと
     # ギャラリーが空のまま表示される
