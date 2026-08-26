@@ -274,6 +274,25 @@ def on_upscale(last, idx):
 
 
 # ---------- お気に入り ----------
+FAV_LABEL = "★"          # 未登録
+FAV_LABEL_DONE = "★ 済"  # 登録済み
+
+
+def _fav_button(state, idx):
+    """選択中の画像がお気に入り済みかどうかで、ボタンの見た目を返す。
+
+    済みのときは primary（塗りつぶし）にして、ラベルにも印を付ける。
+    色だけだと分かりにくい環境があるので、両方で示す。
+    """
+    if not state or not state.get("paths"):
+        return gr.update(value=FAV_LABEL, variant="secondary", interactive=True)
+    i = 0 if idx is None else min(int(idx), len(state["paths"]) - 1)
+    name = Path(state["paths"][i]).name
+    if (FAV_DIR / name).exists():
+        return gr.update(value=FAV_LABEL_DONE, variant="primary", interactive=False)
+    return gr.update(value=FAV_LABEL, variant="secondary", interactive=True)
+
+
 def list_favorites():
     """お気に入りフォルダの画像を新しい順で返す。"""
     if not FAV_DIR.exists():
@@ -454,20 +473,53 @@ def _need_meta(state):
     return None
 
 
-def on_hist_variations(state, idx):
-    msg = _need_meta(state)
+# ---------- 操作対象の切り替え ----------
+# ボタンは 1 組しか置かない。押されたとき、右カラムでどちらのサブタブを開いているかで
+# 「今回の生成結果」と「履歴で選んだ画像」のどちらに作用するかを決める。
+def _target(which, last, picked, hist_sel):
+    """(状態, 番号, エラーメッセージ) を返す。"""
+    if which == "history":
+        if not hist_sel:
+            return None, 0, "履歴から画像を選んでください。"
+        if hist_sel.get("no_meta"):
+            return None, 0, ("この画像には生成条件が記録されていないため実行できません"
+                             "（この機能より前に作られた画像です）。")
+        return hist_sel, 0, None
+    if not last or not last.get("images"):
+        return None, 0, "先に画像を生成してください。"
+    return last, picked, None
+
+
+def fav_button_state(which, last, picked, hist_sel):
+    """いま操作対象になっている画像で、お気に入りボタンの見た目を決める。"""
+    if which == "history":
+        return _fav_button(hist_sel, 0)
+    return _fav_button(last, picked)
+
+
+def on_variations_target(which, last, picked, hist_sel):
+    state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
         yield gr.update(), msg, gr.skip()
         return
     yield from on_variations(state, idx)
 
 
-def on_hist_upscale(state, idx):
-    msg = _need_meta(state)
+def on_upscale_target(which, last, picked, hist_sel):
+    state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
         yield gr.update(), msg, gr.skip()
         return
     yield from on_upscale(state, idx)
+
+
+def on_favorite_target(which, last, picked, hist_sel):
+    # お気に入りは生成条件が要らないので no_meta でも通す
+    if which == "history":
+        if not hist_sel:
+            return "履歴から画像を選んでください。", gr.update()
+        return on_favorite(hist_sel, 0)
+    return on_favorite(last, picked)
 
 
 # ---------- モデルを追加（Civitai） ----------
@@ -562,58 +614,39 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
                             seed = gr.Number(-1, label="Seed (-1 でランダム)", precision=0)
 
                 with gr.Column(scale=1):
-                    gallery = gr.Gallery(
-                        label="結果", columns=2, height=760, object_fit="contain",
-                    )
+                    # 今回の生成結果と過去の履歴を、同じ場所でサブタブとして切り替える。
+                    # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
+                    with gr.Tabs() as out_tabs:
+                        with gr.Tab("今回の結果", id="current") as cur_tab:
+                            gallery = gr.Gallery(
+                                label="結果", columns=2, height=680, object_fit="contain",
+                            )
+                        with gr.Tab("履歴", id="history") as hist_tab:
+                            hist_count = gr.Markdown("")
+                            hist_gallery = gr.Gallery(
+                                label="生成履歴（クリックで選択）", columns=3, height=620,
+                                object_fit="contain",
+                            )
+                            hist_detail = gr.Markdown("画像を選ぶと操作できます。")
+
                     with gr.Row():
                         variation = gr.Button(
-                            f"この絵を少しだけ変える（{VARIATION_COUNT} 枚）", variant="secondary", scale=2
+                            f"少しだけ変える（{VARIATION_COUNT} 枚）", variant="secondary", scale=3
                         )
-                        favorite = gr.Button("★ お気に入り", variant="secondary", scale=1)
-                    hires = gr.Button(
-                        f"選択した画像を {HIRES_SCALE:g} 倍に高解像度化", variant="secondary"
-                    )
+                        hires = gr.Button(
+                            f"解像度を {HIRES_SCALE:g} 倍", variant="secondary", scale=3
+                        )
+                        # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
+                        favorite = gr.Button(FAV_LABEL, variant="secondary", scale=1)
                     info = gr.Textbox(label="生成情報", interactive=False, lines=2)
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
                     last_gen = gr.State(None)
                     picked = gr.State(None)
-
-        with gr.Tab("生成履歴", id="history") as hist_tab:
-            gr.Markdown(
-                "`outputs/` に保存された画像を新しい順に表示します"
-                "（このタブを開くたびに自動で最新になります）。"
-                "画像を選ぶと、生成タブに戻らずにそのまま操作できます。"
-            )
-            hist_count = gr.Markdown("")
-
-            with gr.Row(equal_height=False):
-                with gr.Column(scale=1):
-                    hist_gallery = gr.Gallery(
-                        label="生成履歴（クリックで選択）", columns=4, height=640,
-                        object_fit="contain",
-                    )
-                with gr.Column(scale=1):
-                    hist_detail = gr.Markdown("画像を選ぶと操作できます。")
-                    with gr.Row():
-                        hist_variation = gr.Button(
-                            f"この絵を少しだけ変える（{VARIATION_COUNT} 枚）",
-                            variant="secondary", scale=2,
-                        )
-                        hist_favorite = gr.Button("★ お気に入り", variant="secondary", scale=1)
-                    hist_hires = gr.Button(
-                        f"選択した画像を {HIRES_SCALE:g} 倍に高解像度化", variant="secondary"
-                    )
-                    gr.Markdown(
-                        "「少しだけ変える」「高解像度化」を押すと**生成タブに移動**して"
-                        "結果が表示されます。そのまま続けて操作できます。"
-                    )
-                    hist_info = gr.Textbox(label="情報", interactive=False, lines=2)
-
-            # 選択中の画像とその生成条件（生成タブの last_gen と同じ形）
-            hist_sel = gr.State(None)
-            hist_idx = gr.State(0)
+                    # 履歴側で選ばれている画像の条件と、いま開いているサブタブ
+                    hist_sel = gr.State(None)
+                    which_out = gr.State("current")
 
         with gr.Tab("お気に入り", id="favorites") as fav_tab:
             gr.Markdown(
@@ -662,6 +695,9 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
             cands_state = gr.State([])
             sel_state = gr.State(None)
 
+    # お気に入りボタンの表示更新は多くの操作の後に走るので、引数をまとめておく
+    _fav_args = ([which_out, last_gen, picked, hist_sel], favorite)
+
     preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
     model_dd.change(on_model_change, model_dd, preset_outputs)
     refresh.click(lambda: gr.update(choices=list_checkpoints()), None, model_dd)
@@ -677,8 +713,10 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
         [model_dd, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
          in_image, strength],
         [gallery, info, last_gen],
-    ).then(lambda: None, None, picked)
-    gallery.select(on_pick_result, None, picked)
+    ).then(lambda: None, None, picked).then(fav_button_state, *_fav_args)
+    gallery.select(on_pick_result, None, picked).then(
+        fav_button_state, *_fav_args
+    )
     # 拡大表示を閉じたらブラウザのフルスクリーンも解除する。
     # Gallery 側は fullscreen を解除しないため（frontend に exitFullscreen が無い）、
     # 閉じても全画面の格子表示が残り、元の画面に戻れなくなる。
@@ -690,42 +728,55 @@ with gr.Blocks(title="RTX Easy Image Gen") as demo:
     gallery.preview_close(None, None, None, js=_EXIT_FS)
     fav_gallery.preview_close(None, None, None, js=_EXIT_FS)
     # 生成・変分・高解像度化のたびに選択番号を捨てる（結果が入れ替わるため）
-    hires.click(on_upscale, [last_gen, picked], [gallery, info, last_gen]).then(
-        lambda: None, None, picked
-    )
-    variation.click(on_variations, [last_gen, picked], [gallery, info, last_gen]).then(
-        lambda: None, None, picked
-    )
-    favorite.click(on_favorite, [last_gen, picked], [info, fav_gallery])
     # タブを開いたときに自動で読み直す（再読み込みボタンは置かない）。
     # 生成やお気に入り移動でフォルダの中身が変わるので、開くたびに最新にする
-    hist_tab.select(on_refresh_history, None,
-                    [hist_gallery, hist_count, hist_sel, hist_detail])
-    demo.load(on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail])
-    hist_gallery.select(on_pick_history, None, [hist_sel, hist_detail])
-    hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
-    # 生成タブ用のハンドラをそのまま使う（state の形を合わせてある）。
-    # 実行後は履歴が増えるので一覧も更新する
-    # 履歴からの再生成は、結果を生成タブのギャラリーに出して画面ごと移動する。
-    # 履歴タブに結果表示を二重に持たず、移動先でそのまま続けて操作できるようにするため。
-    # last_gen も更新するので、生成タブ側のボタンがそのまま効く。
-    def _to_gen():
-        return gr.Tabs(selected="gen")
+    # --- 右カラムのサブタブ ---
+    # どちらを開いているかを覚え、ボタンはその側の画像に作用する
+    # どちらのサブタブを開いているかを覚える。
+    # Tabs の select が返す evt.value はラベル文字列なので、id と取り違えないよう
+    # タブごとに定数を返す形にしている。
+    cur_tab.select(lambda: "current", None, which_out).then(
+        fav_button_state, [which_out, last_gen, picked, hist_sel], favorite
+    )
 
-    hist_variation.click(
-        on_hist_variations, [hist_sel, hist_idx], [gallery, info, last_gen]
-    ).then(_to_gen, None, tabs).then(
-        on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail]
+    hist_tab.select(
+        lambda: (*on_refresh_history(), "history"), None,
+        [hist_gallery, hist_count, hist_sel, hist_detail, which_out],
+    ).then(fav_button_state, *_fav_args)
+    hist_gallery.select(on_pick_history, None, [hist_sel, hist_detail]).then(
+        fav_button_state, *_fav_args
     )
-    hist_hires.click(
-        on_hist_upscale, [hist_sel, hist_idx], [gallery, info, last_gen]
-    ).then(_to_gen, None, tabs).then(
-        on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail]
-    )
-    # お気に入りは画像が増えるわけではないので履歴タブに留まる（続けて選別しやすい）
-    hist_favorite.click(
-        on_favorite, [hist_sel, hist_idx], [hist_info, fav_gallery]
-    ).then(on_refresh_history, None, [hist_gallery, hist_count, hist_sel, hist_detail])
+    hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
+
+    # --- 操作ボタン（1 組で両方のサブタブを兼ねる）---
+    # 再生成したら「今回の結果」へ切り替え、履歴一覧も更新する。
+    # 結果の表示場所を 1 か所に保ちつつ、履歴に新しい画像を反映させるため。
+    def _to_current():
+        return gr.Tabs(selected="current"), "current"
+
+    _refresh_hist = (on_refresh_history, None,
+                     [hist_gallery, hist_count, hist_sel, hist_detail])
+
+    variation.click(
+        on_variations_target, [which_out, last_gen, picked, hist_sel],
+        [gallery, info, last_gen],
+    ).then(_to_current, None, [out_tabs, which_out]).then(
+        lambda: None, None, picked
+    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+
+    hires.click(
+        on_upscale_target, [which_out, last_gen, picked, hist_sel],
+        [gallery, info, last_gen],
+    ).then(_to_current, None, [out_tabs, which_out]).then(
+        lambda: None, None, picked
+    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+
+    # お気に入りは画像が増えないのでサブタブは切り替えない
+    favorite.click(
+        on_favorite_target, [which_out, last_gen, picked, hist_sel],
+        [info, fav_gallery],
+    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+
     fav_tab.select(on_refresh_favorites, None, [fav_gallery, fav_count])
     demo.load(on_refresh_favorites, None, [fav_gallery, fav_count])
     # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
