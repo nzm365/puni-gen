@@ -22,8 +22,8 @@ API = "https://danbooru.donmai.us/tags.json"
 UA = {"User-Agent": "rtx-easy-image-gen/1.0 (prompt tag autocomplete)"}
 
 # meta タグ（category 5: highres, commentary_request 等）はプロンプトに使わないので除外。
-# 絵師名 (category 1) も除外する: 特定の作家の画風を名指しで模倣する用途に直結するため、
-# 補完候補としては出さない方針。
+# イラストレーター名 (category 1) も除外する: 特定の作家の画風を名指しで模倣する用途に
+# 直結するため、補完候補としては出さない方針。
 # 0=general 3=copyright 4=character を残す
 KEEP_CATEGORIES = {0, 3, 4}
 PER_PAGE = 1000

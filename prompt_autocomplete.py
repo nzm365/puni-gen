@@ -16,7 +16,7 @@ TAGS_CSV = Path(__file__).parent / "data" / "danbooru_tags.csv"
 TARGET_IDS = ["prompt_box", "neg_box"]
 
 # category → (色, ラベル)。Danbooru の区分に合わせる。
-# 絵師名 (category 1) は辞書生成の段階で除外しているのでここにも持たない
+# イラストレーター名 (category 1) は辞書生成の段階で除外しているのでここにも持たない
 CAT_META = {
     0: ("#8cc4ff", "一般"),
     3: ("#d6a5f5", "版権"),
