@@ -222,6 +222,10 @@ def on_upscale(last, idx):
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
     src = images[i]
+    # seed は画像ごとに違うので seeds から取る。
+    # 履歴から作る状態には seeds しか無く、単数の seed を読むと KeyError になっていた。
+    seeds = last.get("seeds") or []
+    seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
     if engine.current != last["ckpt"]:
         load_or_alert(last["ckpt"])
@@ -233,7 +237,7 @@ def on_upscale(last, idx):
         try:
             res["out"] = engine.upscale(
                 src, last["prompt"], last["negative"], last["cfg"], last["sampler"],
-                last["clip_skip"], last["seed"],
+                last["clip_skip"], seed,
                 preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
             )
         except Exception as e:  # noqa: BLE001
