@@ -206,6 +206,10 @@ class Engine:
             self._vae_fp32 = set(json.loads(VAE_FP32_FILE.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError, TypeError):
             pass
+        # 見積りが外れて実際に載らなかった / bf16 でも NaN が出た、のように
+        # 「予測ではなく実測で」タイル分割が要ると分かったときだけ立てる。
+        # 立っている間は毎回の判定を飛ばし、モデルを入れ替えるまで戻さない
+        self._vae_force_tiling = False
         self._taesd = None  # AutoencoderTiny | "unavailable" | None (未初期化)
         self._taesd_started = False
         if torch.cuda.is_available():
@@ -251,7 +255,7 @@ class Engine:
             # 常駐時はタイル分割しない。プリセット解像度 (832x1216 / 1024x1536) は
             # 旧実装ではどちらも常にタイル分割を踏んでいた（しきい値が 1024px のため）。
             # 一括デコードの方が速く、タイル境界の継ぎ目も原理的に消える。
-            # 万一 VRAM に載らなければ _decode_latents が OOM を検出して自動でタイル分割に落とす。
+            # 万一 VRAM に載らなければ _decode_latents がデコードごとに判定して落とす。
         # fp16 デコードで NaN を出した実績のあるモデルだけ fp32 に昇格させる。
         # (デコードは _decode_latents が自前で制御する。このフラグは i2i の encode 側に効く)
         pipe.vae.config.force_upcast = ckpt_name in self._vae_fp32
@@ -260,6 +264,7 @@ class Engine:
             # 初回生成の fp16 探り直し (NaN → 撮り直し) を省く
             pipe.vae.to(safe_vae_dtype())
         self._offload = offload
+        self._vae_force_tiling = False  # 前のモデルで得た実測の記憶は持ち越さない
         self.current = ckpt_name
         if not self._taesd_started:  # プレビュー用の軽量 VAE を裏で用意しておく
             self._taesd_started = True
@@ -446,6 +451,43 @@ class Engine:
         finally:
             torch.backends.cudnn.benchmark = prev
 
+    def _plan_tiling(self, lat: torch.Tensor) -> None:
+        """このデコードでタイル分割を使うかを毎回決め、明示的に切り替える。
+
+        一括デコードは、VRAM の空きが足りないと OOM 例外を出さずに共有メモリへ
+        溢れて数十秒〜数分級になる (Windows の仕様)。例外で捕まえられないので、
+        必要量を見積もって足りなければタイル分割へ落とす。
+        必要量はデコード活性のピーク実測から: おおよそ 5500 bytes/出力ピクセル
+        (fp16/bf16。4400 では判定を通ったのに peak 13.5GB まで溢れたため保守的に)
+
+        毎回決め直すのが要点。以前はここで enable_tiling() を呼ぶだけで戻す側が
+        無かったため、他アプリが一時的に VRAM を掴んでいた等で一度でも分割に入ると、
+        モデルを読み直すまでずっと分割のままだった。常駐時は一括の方が速く、
+        タイル境界の継ぎ目も出ないので、その状態に自力で戻れるようにする。
+        """
+        vae = self.pipe.vae
+        pixels = lat.shape[-2] * lat.shape[-1] * 64  # latent 1 画素 = 出力 8x8 画素
+        need = pixels * (11000 if vae.dtype == torch.float32 else 5500)
+        free = torch.cuda.mem_get_info()[0]
+        avail = free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+
+        # オフロード時は見積りに関係なく常に分割する。ロード判定の OFFLOAD_HEADROOM_GB
+        # (1.5GB) が「タイル分割デコード前提」で常駐時より小さく取ってあるため、
+        # ここで一括に戻すとロードを通した前提そのものが崩れる。
+        note = ""
+        if self._offload:
+            tile, note = True, " / オフロード中は常に分割"
+        elif self._vae_force_tiling:
+            tile, note = True, " / 実測で不足と判明済み"
+        else:
+            tile = avail < need
+        if tile:
+            vae.enable_tiling()
+        else:
+            vae.disable_tiling()
+        print(f"[vae] {'タイル分割' if tile else '一括'}デコード "
+              f"(必要 ~{need / 1024**3:.1f}GB / 利用可 {avail / 1024**3:.1f}GB{note})")
+
     def _decode_latents(self, latents: torch.Tensor) -> list[Image.Image]:
         """latent を 1 枚ずつ画像へ。fp16 一括デコードを基本に、二段の安全網を持つ。
 
@@ -467,20 +509,7 @@ class Engine:
         if self.current in self._vae_fp32 and vae.dtype == torch.float16:
             # 既知の fp16 非対応モデル。最初から安全な dtype (bf16、無ければ fp32) で回す
             vae.to(safe_vae_dtype())
-        if not getattr(vae, "use_tiling", False):
-            # 一括デコードは、VRAM の空きが足りないと OOM 例外を出さずに共有メモリへ
-            # 溢れて数十秒〜数分級になる (Windows の仕様)。例外で捕まえられないので、
-            # 必要量を見積もって足りなければ事前にタイル分割へ落とす。
-            # 必要量はデコード活性のピーク実測から: おおよそ 5500 bytes/出力ピクセル
-            # (fp16/bf16。4400 では判定を通ったのに peak 13.5GB まで溢れたため保守的に)
-            pixels = lat.shape[-2] * lat.shape[-1] * 64  # latent 1 画素 = 出力 8x8 画素
-            need = pixels * (11000 if vae.dtype == torch.float32 else 5500)
-            free = torch.cuda.mem_get_info()[0]
-            avail = free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-            if avail < need:
-                print(f"[vae] 空き VRAM が一括デコードに足りないためタイル分割で実行 "
-                      f"(必要 ~{need / 1024**3:.1f}GB / 利用可 {avail / 1024**3:.1f}GB)")
-                vae.enable_tiling()
+        self._plan_tiling(lat)
         pils: list[Image.Image] = []
         with self._no_cudnn_benchmark():
             pils = self._decode_loop(lat, pils)
@@ -521,6 +550,7 @@ class Engine:
                         # bf16 でも NaN (理論上ほぼ起きない)。最後の砦の fp32 + タイル分割へ
                         vae.to(torch.float32)
                         vae.enable_tiling()
+                        self._vae_force_tiling = True
                         print(f"[vae] {self.current}: bf16 でも NaN/Inf のため fp32 (タイル分割) に切替")
 
                     continue
@@ -530,6 +560,7 @@ class Engine:
                 print("[vae] 一括デコードが VRAM に載らないためタイル分割に切替")
                 torch.cuda.empty_cache()
                 vae.enable_tiling()
+                self._vae_force_tiling = True  # 見積りが外れた。以後は毎回の判定より優先
                 continue
             pils += pipe.image_processor.postprocess(img.float(), output_type="pil")
             i += 1
