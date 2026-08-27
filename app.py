@@ -69,7 +69,11 @@ RESULT_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 
 
 # PNG に埋め込むキー。JSON 側が本体で、parameters は他ツール互換の読み物
-META_KEY = "rtx_easy_image_gen"
+META_KEY = "puni_gen"
+# 改名前 (RTX Easy Image Gen) に生成した画像が持つキー。読むときだけ見る。
+# 落とすと、手元にある既存の画像から「少しだけ変える」「解像度を2倍」が
+# できなくなる (生成条件を読み出せないため)
+LEGACY_META_KEY = "rtx_easy_image_gen"
 
 
 def _png_meta(params: dict) -> PngImagePlugin.PngInfo:
@@ -97,7 +101,7 @@ def read_meta(path) -> dict | None:
     """PNG から生成条件を読み戻す。無ければ None（古い画像や外部の画像）。"""
     try:
         with Image.open(path) as im:
-            raw = im.info.get(META_KEY)
+            raw = im.info.get(META_KEY) or im.info.get(LEGACY_META_KEY)
         return json.loads(raw) if raw else None
     except (OSError, ValueError):
         return None
@@ -606,9 +610,9 @@ def on_download(cands, idx, progress=gr.Progress()):
 
 
 emb_tokens = sorted(p.stem for p in EMB_DIR.glob("*.safetensors"))
-with gr.Blocks(title="RTX Easy Image Gen") as demo:
+with gr.Blocks(title="PuniGen") as demo:
     ckpts = list_checkpoints()
-    gr.Markdown("## RTX Easy Image Gen")
+    gr.Markdown("## PuniGen")
 
     with gr.Tabs() as tabs:
         with gr.Tab("生成", id="gen"):
