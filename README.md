@@ -4,6 +4,8 @@ setup.bat と start.bat を順に実行すれば動きます。
 複雑なことはできません。手元にグラボがあるからとりあえず画像生成を試してみたい方にお勧めです。
 現状、LoRAやControlNetには対応していません。必要な方はComfyUIを使ってください。LoRAにはそのうち対応する予定です。
 
+**P**uni **U**ses **N**o **I**ntricacy.
+
 ![PuniGen の画面](docs/screenshot0.png)
 
 ## 主な機能
