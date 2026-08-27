@@ -1,9 +1,0 @@
-{
-  "steps": 30,
-  "cfg": 5.0,
-  "sampler": "euler_a",
-  "clip_skip": 2,
-  "size": [1024, 1536],
-  "prefix_pos": "lazypos, ",
-  "default_neg": "lazyneg"
-}

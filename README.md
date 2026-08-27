@@ -171,8 +171,8 @@ API キーの設定を確認してください。401 は失効か入力ミス、
   "sampler": "euler_a",
   "clip_skip": 2,
   "size": [1024, 1536],
-  "prefix_pos": "lazypos, ",
-  "default_neg": "lazyneg"
+  "prefix_pos": "masterpiece, best quality, ",
+  "default_neg": "worst quality, low quality, bad anatomy, watermark"
 }
 ```
 
