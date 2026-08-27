@@ -1,14 +1,10 @@
 # PuniGen
-
-**P**uni **U**ses **N**o **I**ntricacy.
-diffusers ベースの SDXL / Illustrious 系画像生成ツール。
+PuniGen（ぷにじぇん）はdiffusers ベースの SDXL / Illustrious 系画像生成ツールです。
 setup.bat と start.bat を順に実行すれば動きます。
+複雑なことはできません。手元にグラボがあるからとりあえず画像生成を試してみたい方にお勧めです。
+現状、LoRAやControlNetには対応していません。必要な方はComfyUIを使ってください。LoRAにはそのうち対応する予定です。
 
 ![PuniGen の画面](docs/screenshot0.png)
-
-![PuniGen の画面](docs/screenshot1.png)
-
-
 
 ## 主な機能
 
@@ -256,3 +252,5 @@ outputs/20260822_154812_123456789.png
 [MIT License](LICENSE) — Copyright (c) 2026 Nozomu
 
 本ツール自体のライセンスであり、生成した画像やダウンロードしたモデルには適用されません。チェックポイントや embedding には配布元それぞれの利用規約があるので、そちらを確認してください。
+
+
