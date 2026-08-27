@@ -19,7 +19,7 @@ import requests
 
 OUT = Path(__file__).parent / "data" / "danbooru_tags.csv"
 API = "https://danbooru.donmai.us/tags.json"
-UA = {"User-Agent": "rtx-easy-image-gen/1.0 (prompt tag autocomplete)"}
+UA = {"User-Agent": "PuniGen/1.0 (prompt tag autocomplete)"}
 
 # meta タグ（category 5: highres, commentary_request 等）はプロンプトに使わないので除外。
 # イラストレーター名 (category 1) も除外する: 特定の作家の画風を名指しで模倣する用途に
