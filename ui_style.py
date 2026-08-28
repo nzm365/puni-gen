@@ -1,6 +1,6 @@
 """画面まわりの CSS（Gradio の launch(css=...) に渡す）。
 
-やっていることは 2 つ。
+やっていることは 5 つ。
 
 1. 表示倍率を下げる
    Gradio の既定は余白も文字も大きめで、フル HD だとページ全体が 1070px になり
@@ -15,11 +15,34 @@
    Gradio のボタンはラベルの HTML をエスケープするので SVG を直接は埋め込めない
    （試したところ、タグがそのまま文字として表示された）。
    そこで app.py 側は状態をクラス名で伝えるだけにし、星はここで背景画像として描く。
+
+3. 進捗バーを描く
+   待ちには 2 種類ある。step 数のように残りが数えられるものは、実際の割合まで
+   伸びるバーで出す。モデルの読み込みのように数えられないものは、割合を偽らずに
+   丸い塊を左右に往復させて「止まっていない」ことだけを示す。
+   往復の折り返しで横に伸び縮みさせているのは、PuniGen の名前のとおり
+   柔らかい印象にするため（縞模様も試したが、角が立って固い見た目になった）。
+   app.py が中身を空にすると要素ごと消えるので、待ちが無いときは場所を取らない。
+
+4. モデル選択と再読み込みボタンを 1 つの入力グループに見せる
+   Dropdown が自分で描く枠は「ドロップダウンだ」と分かるための枠なので消さない。
+   行にもう 1 つ枠を足すと二重になるので、行は枠を持たず、
+   ボタンを選択欄の右へ密着させて、まとまった 1 つの部品に見せる。
+
+5. 効かない「共有」ボタンを隠す
+   画像を開くと右上に出るが、これは Gradio の Hugging Face Spaces へ共有する
+   機能で、Spaces 上でしか成立しない。ローカルで押すと Share failed. が出るだけ。
+   Gallery 側に出し分けの引数が無い（Gradio 6 で無くなった）ので CSS で隠す。
 """
 from __future__ import annotations
 
 # 表示倍率。ブラウザのズーム率と同じ意味で、下げるほど一度に見える量が増える
 UI_ZOOM = 90
+
+# 再読み込みボタンの高さ。選択欄の高さに合わせる値。
+# 選択欄の高さは --checkbox-label-padding（テーマ側で決まり、CSS ファイルからは
+# 読めない）に依存するため計算では出せない。ここだけ実測で合わせる
+REFRESH_BTN_HEIGHT = "42px"
 
 # 星の形。角を少し丸めて、フォントの ★ より柔らかい印象にしている
 _STAR_PATH = (
@@ -47,14 +70,164 @@ gradio-app {
     zoom: __ZOOM__%;
 }
 
+/* ---- 効かない「共有」ボタンを隠す ----
+   画像を開いたときの右上に出る。押しても Share failed. のトーストが出るだけで、
+   ローカル実行では成立しない機能なので出さない（実際に押して確認した）。
+   英語表記も併記しているのは、Gradio の翻訳が揃っておらず、同じ並びに
+   「ダウンロード」と「Fullscreen」が混在するなど、環境で表記が変わるため。
+   ダウンロード / Fullscreen / 閉じるはそのまま残す。 */
+.gradio-container button[aria-label="共有"],
+.gradio-container button[aria-label="Share"] {
+    display: none;
+}
+
+/* ---- モデル選択 + 再読み込みボタン ----
+   「プレフィックス」などの入力欄と同じ見た目にする。Gradio のあの枠は border ではなく
+   .block padded の地色 + 内側の余白なので、同じ変数を行に当てて同じ箱を作る。
+   中の Dropdown からは箱としての役割を外し、選択欄の枠 (.container .wrap) だけ残す。
+   こうすると、ラベル・選択欄・ボタンが 1 つの箱に収まり、他の入力欄と揃う。 */
+#model_row {
+    background: var(--block-background-fill);
+    border: var(--block-border-width, 0px) solid var(--block-border-color, transparent);
+    border-radius: var(--block-radius, 8px);
+    padding: var(--block-padding, 10px 12px);
+    gap: var(--spacing-sm, 4px);
+    flex-wrap: nowrap;
+    /* ラベル「モデル」のぶん選択欄は下寄りにあるので、下端で揃える */
+    align-items: flex-end;
+    margin-bottom: var(--size-2, 8px);
+}
+/* 中の入れ物は箱の役割を持たない。地色も余白も外側の行が持つ */
+#model_row .block,
+#model_row .form {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    padding: 0;
+}
+
+/* 再読み込みボタン。幅は文字 1 つぶんまで詰め、高さは選択欄に合わせる。
+   高さは --checkbox-label-padding 依存でテーマ側でしか決まらず計算で出せないため、
+   ブラウザで実測して REFRESH_BTN_HEIGHT に置いている */
+#model_row button {
+    min-width: 0;
+    width: 2.3rem;
+    flex: 0 0 2.3rem;
+    height: __BTN_H__;
+    padding: 0;
+    border: var(--input-border-width, 1px) solid var(--border-color-primary, #3f3f46);
+    border-radius: var(--input-radius, 4px);
+    background: var(--button-secondary-background-fill, #3f3f46);
+    box-shadow: var(--input-shadow, none);
+    color: var(--body-text-color, #e4e4e7);
+    font-size: 1.05rem;
+    line-height: 1;
+    cursor: pointer;
+}
+#model_row button:hover {
+    background: var(--button-secondary-background-fill-hover, #52525b);
+}
+/* 押した瞬間に沈める。反応があったことを触感として返す */
+#model_row button:active {
+    transform: translateY(1px);
+    box-shadow: none;
+}
+
+/* ---- 進捗バー ----
+   app.py の progress（左カラム・モデルの状態表示の直下）専用。
+   「いま何をしているか」はここだけに出る。
+   空文字を入れると中身ごと消えるので、待ちが無いときは行が畳まれる。 */
+#progress_line {
+    min-height: 0;
+    /* status と左端をそろえる */
+    padding: 0;
+}
+
+/* Gradio はジェネレータの実行中、出力コンポーネントの枠を 2 秒周期で点滅させる
+   (statustracker の .generating: 2px の枠 + 明滅)。
+   生成の進み具合はこの進捗バーが受け持っているので、同じことを枠の明滅でも
+   主張されると二重になる。特に「生成情報」は生成中は空のまま光り、
+   結果ギャラリーは大きな橙の矩形になって、進捗バーと離れた位置で目立ってしまう。
+   バーが受け持つ 3 つだけ明滅を止める。検索結果のように、バーが無くて
+   この明滅が唯一の反応になる箇所はそのまま残す */
+#progress_line .generating,
+#result_gallery .generating,
+#gen_info .generating {
+    border: none !important;
+    animation: none !important;
+}
+#progress_line .pg {
+    margin: 0 0 6px;
+}
+#progress_line .pg-text {
+    font-size: 0.9em;
+    color: var(--body-text-color-subdued, #71717a);
+    margin-bottom: 4px;
+}
+#progress_line .pg-track {
+    height: 8px;
+    border-radius: 999px;
+    background: var(--background-fill-secondary, #ececf1);
+    overflow: hidden;
+}
+#progress_line .pg-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #fdba74, var(--color-accent, #f97316));
+    transition: width 0.25s ease;
+}
+
+/* 残りが数えられない待ち。丸い塊が左右を往復する。
+   translateX と scaleX だけで動かすので、毎フレームのレイアウト計算が要らない。
+   幅 32% の塊を自分の幅の 212% ぶん動かすと 32 + 32*2.12 = 99.8%、
+   ちょうど端から端まで届く。折り返しは alternate に任せる。
+   中間で scaleX を 1.35 に膨らませ、伸びて縮む柔らかい動きにしている */
+#progress_line .pg-ind .pg-fill {
+    width: 32%;
+    transform-origin: center;
+    animation: pg-puni 1.3s cubic-bezier(0.45, 0, 0.55, 1) infinite alternate;
+}
+@keyframes pg-puni {
+    from { transform: translateX(0) scaleX(1); }
+    50%  { transform: translateX(106%) scaleX(1.35); }
+    to   { transform: translateX(212%) scaleX(1); }
+}
+
+/* 終わったあと。満杯のバーを緑にして残す。
+   消してしまうと、待たされていた人に結果が残らない */
+#progress_line .pg-done .pg-fill {
+    background: linear-gradient(90deg, #86efac, #22c55e);
+}
+#progress_line .pg-done .pg-text {
+    color: var(--body-text-color, #27272a);
+}
+
+/* 一言だけのとき（中止しました、など）はバーを出さない */
+#progress_line .pg-note .pg-text {
+    margin-bottom: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    /* 動きを止める設定では往復させず、控えめな塊を中央に置くだけにする */
+    #progress_line .pg-ind .pg-fill {
+        animation: none;
+        transform: translateX(106%);
+        opacity: 0.55;
+    }
+    #progress_line .pg-fill { transition: none; }
+}
+
 /* ---- お気に入りボタンの星 ----
    ラベルは空にしてあり、星はここで背景画像として描く。
    未登録は輪郭だけのグレー、登録済みは塗りつぶしの黄色。 */
 .gradio-container button.fav-btn {
     background-image: url("data:image/svg+xml,__STAR_OFF__");
-    background-repeat: no-repeat;
-    background-position: center;
-    background-size: 20px 20px;
+    /* 登録済みのときは variant="primary" が付く。Gradio の .primary は background を
+       一括指定で当てるので、repeat / position / size が初期値に戻され、星が
+       ボタン一面に敷き詰められる（実際にそうなっていた）。ここは譲らない */
+    background-repeat: no-repeat !important;
+    background-position: center !important;
+    background-size: 20px 20px !important;
     min-width: 46px;
     /* ラベルが空だと、display:flex のボタンは中身が無いぶん高さ 14px まで潰れる
        （文字ありのボタンは 36px）。line-height も min-height も期待どおり効かないので、
@@ -73,10 +246,10 @@ gradio-app {
 
 /* 押せることが分かるよう、触れたときだけ少しだけ大きくする */
 .gradio-container button.fav-btn:hover {
-    background-size: 22px 22px;
+    background-size: 22px 22px !important;
 }
 @media (prefers-reduced-motion: reduce) {
-    .gradio-container button.fav-btn:hover { background-size: 20px 20px; }
+    .gradio-container button.fav-btn:hover { background-size: 20px 20px !important; }
 }
 """
 
@@ -84,6 +257,7 @@ gradio-app {
 def build_css() -> str:
     return (
         CSS.replace("__ZOOM__", str(UI_ZOOM))
+        .replace("__BTN_H__", REFRESH_BTN_HEIGHT)
         .replace("__STAR_OFF__", _star("none", "%23a1a1aa"))
         .replace("__STAR_ON__", _star("%23fbbf24", "%23f59e0b"))
     )

@@ -1,4 +1,5 @@
 """最小構成の Gradio UI。モデルを切り替えるとプリセット（推奨設定）が自動で入る。"""
+import html
 import json
 import queue
 import shutil
@@ -26,6 +27,37 @@ FAV_DIR = Path(__file__).parent / "favorites"
 EMB_DIR = Path(__file__).parent / "models" / "embeddings"
 engine = Engine()
 
+# ---------- 進捗表示 ----------
+# ギャラリー下の 1 行に出す HTML を組み立てる。「いま何をしているか」はここだけに出す。
+# 待ちには 2 種類あり、見た目を分けている:
+#   - step 数のように残りが数えられるもの  -> 実際の割合まで伸びるバー
+#   - モデルの読み込みのように数えられないもの -> 丸い塊が往復するバー（止まっていない印）
+def _bar(text: str, frac: float | None = None) -> str:
+    """進捗バー。frac が None なら割合不明として塊を往復させる。"""
+    body = html.escape(text)
+    if frac is None:
+        track = '<div class="pg-track pg-ind"><div class="pg-fill"></div></div>'
+    else:
+        pct = max(0.0, min(1.0, frac)) * 100
+        track = f'<div class="pg-track"><div class="pg-fill" style="width:{pct:.1f}%"></div></div>'
+    return f'<div class="pg"><div class="pg-text">{body}</div>{track}</div>'
+
+
+def _done(text: str) -> str:
+    """完了の表示。バーを満杯のまま残す。
+
+    終わった瞬間に消すと、待たされていた人には「結局どうなったのか」が
+    残らない。次の操作で置き換わるまで、終わったことを見えるままにする。
+    """
+    return (f'<div class="pg pg-done"><div class="pg-text">{html.escape(text)}</div>'
+            '<div class="pg-track"><div class="pg-fill" style="width:100%"></div></div></div>')
+
+
+def _note(text: str) -> str:
+    """バーを出さない一言（中止しました、先に生成してください、など）。"""
+    return f'<div class="pg pg-note"><div class="pg-text">{html.escape(text)}</div></div>'
+
+
 ASPECTS = {
     "縦 (プリセット)": None,
     "縦 832x1216": (832, 1216),
@@ -36,24 +68,66 @@ ASPECTS = {
 }
 
 
-def load_or_alert(ckpt) -> str:
+def load_or_alert(ckpt, on_phase=None) -> str:
     """VRAM 不足はトレースバックではなく画面のエラー表示にする。"""
     try:
-        return engine.load(ckpt)
+        return engine.load(ckpt, on_phase=on_phase)
     except InsufficientVram as e:
         raise gr.Error(str(e)) from e
 
 
-def on_model_change(ckpt):
-    """モデル選択 → ロード＋プリセット適用"""
+def on_model_load(ckpt):
+    """モデルを読み込み、進捗バーだけを更新する。
+
+    ロードは 6GB 級のファイル読み込みで数十秒かかる。以前はここが同期呼び出しで、
+    終わるまで画面に何も出ず「固まった」と見えていた。ワーカーに逃がして、
+    engine から届く段階表示を progress に流す。
+
+    出力を progress だけに絞っているのは、Gradio がジェネレータの
+    実行中「出力として宣言した全コンポーネント」の枠を点滅させるため
+    (statustracker の .generating: 2px の枠 + 2 秒周期の明滅)。
+    プリセット欄まで出力に含めると、ロードしている数十秒のあいだ
+    プレフィックスや Steps といった無関係な入力欄まで点滅してしまう。
+    確定後の反映は .success で繋ぐ apply_preset（通常の関数）に任せる。
+    """
     if not ckpt:
-        return [gr.update()] * 7
-    msg = load_or_alert(ckpt)
+        yield ""
+        return
+
+    q: queue.Queue = queue.Queue()
+    res = {}
+
+    def worker():
+        try:
+            res["msg"] = load_or_alert(ckpt, on_phase=q.put)
+        except Exception as e:  # noqa: BLE001
+            res["err"] = e
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    yield _bar("モデルを準備しています...")
+    while (text := q.get()) is not None:
+        yield _bar(text)
+    if "err" in res:
+        e = res["err"]
+        raise e if isinstance(e, gr.Error) else gr.Error(str(e))
+    # VRAM の判定結果は画面には出さない。切り分けに要るのでコンソールには残す
+    print(res["msg"])
+    yield _done("読み込み完了")
+
+
+def apply_preset(ckpt):
+    """ロード完了後にプリセットを入れる。
+
+    通常の関数なので、Gradio はこれらの欄を「生成中」として扱わない（枠が点滅しない）。
+    """
+    if not ckpt:
+        return (gr.skip(),) * 6
     p = load_preset(ckpt)
     # ユーザーがプロンプトを打っている間に、裏で 1 step 回して初回のもたつきを消す
     threading.Thread(target=engine.warmup, args=tuple(p["size"]), daemon=True).start()
     return (
-        msg,
         p["prefix_pos"],
         p["default_neg"],
         p["steps"],
@@ -128,8 +202,6 @@ def _save_async(images, paths, params: dict | None = None):
 
 def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
                 in_image, strength):
-    if engine.current != ckpt:
-        load_or_alert(ckpt)
     size = ASPECTS[aspect] or tuple(load_preset(ckpt)["size"])
     if in_image is not None:
         # i2i では入力のアスペクト比を保ち、選択サイズは画素数の目安として使う
@@ -144,7 +216,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
                      sampler, int(clip_skip), seed, n)
         hit = RESULT_CACHE.get(cache_key)
         if hit is not None:
-            yield (hit[0], hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
+            yield (hit[0], _done("生成完了"), hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
             return
 
     # 生成はワーカースレッドで回し、ここでは途中経過を受け取って画面に流す
@@ -153,11 +225,16 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
 
     def worker():
         try:
+            # モデルのロードもここで行う。呼び出し側でやると最初の yield まで
+            # 到達せず、その数十秒のあいだ画面が完全に無反応になる
+            if engine.current != ckpt:
+                load_or_alert(ckpt, on_phase=lambda t: q.put(("phase", t)))
             res["out"] = engine.generate(
                 full_prompt, negative, size[0], size[1],
                 steps, float(cfg), sampler, int(clip_skip), seed, n,
                 image=in_image, strength=float(strength),
-                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
+                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
             res["err"] = e
@@ -167,20 +244,23 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
     threading.Thread(target=worker, daemon=True).start()
     # 前回の結果を残したままだと「生成中」の表示と一緒に前の絵が見え、
     # それが今まさに生成中の絵だと誤解される。開始時点で必ず空にする
-    yield gr.update(value=[], selected_index=None), "生成中... 0 step", gr.skip()
+    yield gr.update(value=[], selected_index=None), _bar("準備しています..."), gr.skip(), gr.skip()
     while (msg := q.get()) is not None:
-        s, total, imgs = msg
+        if msg[0] == "phase":
+            yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
+            continue
+        _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, f"生成中... {s}/{total} step（途中プレビュー）", gr.skip()
+            yield imgs, _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
         else:
-            yield gr.update(), f"生成中... {s}/{total} step", gr.skip()
+            yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
 
     images, used_seed, perf = res["out"]
     if images is None:  # 中止された
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip()
+        yield gr.update(), _note("中止しました（画像は保存されません）"), gr.skip(), gr.skip()
         return
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -210,7 +290,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         RESULT_CACHE[cache_key] = (images, info, last)
         while len(RESULT_CACHE) > 8:
             RESULT_CACHE.popitem(last=False)
-    yield gr.update(value=images, selected_index=None), info, last
+    yield gr.update(value=images, selected_index=None), _done("生成完了"), info, last
 
 
 # ---------- 高解像度化 (Hires.fix) ----------
@@ -227,7 +307,7 @@ def on_upscale(last, idx):
     engine.upscale 側の実装は残してあるので、戻したくなれば差し替えられる。
     """
     if not last or not last.get("images"):
-        yield gr.update(), "先に画像を生成してください。", gr.skip()
+        yield gr.update(), _note("先に画像を生成してください。"), gr.skip(), gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
@@ -235,21 +315,24 @@ def on_upscale(last, idx):
     seeds = last.get("seeds") or []
     seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
-    yield gr.update(value=[], selected_index=None), "拡大しています...", gr.skip()
+    yield gr.update(value=[], selected_index=None), _bar("準備しています..."), gr.skip(), gr.skip()
 
     q: queue.Queue = queue.Queue()
     res = {}
 
     def worker():
         try:
-            res["out"] = upscaler.upscale(src, upscaler.SCALE)
+            # 初回だけ 17MB のダウンロードとモデル読み込みが入る。
+            # そこも「拡大しています」の一言で覆うと、無反応の時間として見える
+            res["out"] = upscaler.upscale(src, upscaler.SCALE, on_phase=q.put)
         except Exception as e:  # noqa: BLE001
             res["err"] = e
         finally:
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    q.get()
+    while (text := q.get()) is not None:
+        yield gr.update(), _bar(text), gr.skip(), gr.skip()
 
     if "err" in res:
         e = res["err"]
@@ -271,7 +354,7 @@ def on_upscale(last, idx):
         f"file: {path.name}"
     )
     nxt = {**last, "images": out, "paths": [str(path)], "seeds": [seed]}
-    yield gr.update(value=out, selected_index=None), info, nxt
+    yield gr.update(value=out, selected_index=None), _done("拡大完了"), info, nxt
 
 
 # ---------- お気に入り ----------
@@ -357,32 +440,32 @@ def on_favorite(last, idx):
 
 def on_refresh_favorites():
     files = list_favorites()
-    return gr.update(value=files), f"{len(files)} 枚"
+    return gr.update(value=files)
 
 
 # ---------- この絵の続き（変分） ----------
 def on_variations(last, idx):
     """選択中の画像の seed を保ったまま、少しだけ違う絵を 4 枚出す。"""
     if not last or not last.get("images"):
-        yield gr.update(), "先に画像を生成してください。", gr.skip()
+        yield gr.update(), _note("先に画像を生成してください。"), gr.skip(), gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
     base_seed = last["seeds"][i]
     w, h = last["size"]
 
-    if engine.current != last["ckpt"]:
-        load_or_alert(last["ckpt"])
-
     q: queue.Queue = queue.Queue()
     res = {}
 
     def worker():
         try:
+            if engine.current != last["ckpt"]:
+                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)))
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
-                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
+                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
             res["err"] = e
@@ -391,20 +474,23 @@ def on_variations(last, idx):
 
     threading.Thread(target=worker, daemon=True).start()
     # 選択も解除する（前の絵を選んだままだと新しい結果と対応がずれる）
-    yield gr.update(value=[], selected_index=None), "変分を生成中... 0 step", gr.skip()
+    yield gr.update(value=[], selected_index=None), _bar("準備しています..."), gr.skip(), gr.skip()
     while (msg := q.get()) is not None:
-        s, total, imgs = msg
+        if msg[0] == "phase":
+            yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
+            continue
+        _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, f"変分を生成中... {s}/{total} step（途中プレビュー）", gr.skip()
+            yield imgs, _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
         else:
-            yield gr.update(), f"変分を生成中... {s}/{total} step", gr.skip()
+            yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
 
     out, _, perf = res["out"]
     if out is None:
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip()
+        yield gr.update(), _note("中止しました（画像は保存されません）"), gr.skip(), gr.skip()
         return
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -424,7 +510,7 @@ def on_variations(last, idx):
         "paths": [str(p) for p in paths],
         "seeds": [base_seed] * len(out),
     }
-    yield gr.update(value=out, selected_index=None), info, nxt
+    yield gr.update(value=out, selected_index=None), _done("生成完了"), info, nxt
 
 
 # ---------- 生成履歴 ----------
@@ -443,18 +529,7 @@ def on_refresh_history():
     せっかく出た結果を消さないよう触らない（gr.skip）。
     """
     files = list_history()
-    return gr.update(value=files), f"{len(files)} 枚", None, gr.skip()
-
-
-def on_refresh_history_keep():
-    """一覧だけ更新し、選択中の画像は保つ。
-
-    お気に入りの追加・解除の直後に使う。通常の更新は選択を解除するが、
-    それだと解除した直後にもう一度押せず、「履歴から画像を選んでください」と
-    出てしまう（実際にそうなっていた）。
-    """
-    files = list_history()
-    return gr.update(value=files), f"{len(files)} 枚"
+    return gr.update(value=files), None, gr.skip()
 
 
 def on_pick_history(evt: gr.SelectData):
@@ -542,20 +617,35 @@ def fav_button_state(which, last, picked, hist_sel):
     return _fav_button(last, picked)
 
 
-def on_variations_target(which, last, picked, hist_sel):
+def begin_job(which, last, picked, hist_sel):
+    """押された時点で対象を確定し、先に「今回の結果」へ切り替える。
+
+    切り替えはチェーンの最後にあったため、履歴から押すと生成が終わるまで
+    履歴を見たままだった。進捗バーも途中プレビューも右カラムに出るので、
+    待っている間こそそちらを見せたい。だから押した直後に移す。
+
+    対象をここで確定して State に持たせるのは、切り替えに伴って which_out が
+    current になっても、履歴で選んだ画像を見失わないようにするため。
+    """
     state, idx, msg = _target(which, last, picked, hist_sel)
-    if msg:
-        yield gr.update(), msg, gr.skip()
-        return
-    yield from on_variations(state, idx)
+    job = {"state": state, "idx": idx, "msg": msg}
+    if msg:  # 実行できないので、タブも操作対象も動かさない
+        return job, gr.skip(), gr.skip()
+    return job, gr.Tabs(selected="current"), "current"
 
 
-def on_upscale_target(which, last, picked, hist_sel):
-    state, idx, msg = _target(which, last, picked, hist_sel)
-    if msg:
-        yield gr.update(), msg, gr.skip()
+def run_variations(job):
+    if job["msg"]:
+        yield gr.update(), _note(job["msg"]), gr.skip(), gr.skip()
         return
-    yield from on_upscale(state, idx)
+    yield from on_variations(job["state"], job["idx"])
+
+
+def run_upscale(job):
+    if job["msg"]:
+        yield gr.update(), _note(job["msg"]), gr.skip(), gr.skip()
+        return
+    yield from on_upscale(job["state"], job["idx"])
 
 
 def on_favorite_target(which, last, picked, hist_sel):
@@ -619,12 +709,18 @@ with gr.Blocks(title="PuniGen") as demo:
             # 左に操作系、右に生成結果。縦に伸ばさず 1 画面に収める
             with gr.Row(equal_height=False):
                 with gr.Column(scale=1):
-                    with gr.Row():
+                    # 選択欄自身の枠は残し、ボタンをその右へ密着させて
+                    # 1 つの入力グループに見せる（CSS 側で指定）
+                    with gr.Row(elem_id="model_row"):
                         model_dd = gr.Dropdown(
                             ckpts, value=ckpts[0] if ckpts else None, label="モデル", scale=4
                         )
-                        refresh = gr.Button("↻", scale=0)
-                    status = gr.Markdown("")
+                        # min_width を切らないと、Gradio の既定でボタンが横に広がる
+                        refresh = gr.Button("↻", scale=0, min_width=0)
+                    # 進行中のことと、終わったことだけを出す 1 行。
+                    # 「いま何をしているか」の置き場はここ 1 箇所に限る。
+                    # 完成した絵の情報は右の info が受け持つ
+                    progress = gr.HTML("", elem_id="progress_line")
 
                     prefix = gr.Textbox(label="プレフィックス（プリセットから自動）", lines=1)
                     prompt = gr.Textbox(
@@ -642,7 +738,7 @@ with gr.Blocks(title="PuniGen") as demo:
 
                     with gr.Accordion("img2img（画像を置くと、その画像を下敷きに生成）", open=False):
                         in_image = gr.Image(
-                            type="pil", label="入力画像（空なら通常の txt2img）", height=280
+                            type="pil", label="入力画像", height=280
                         )
                         strength = gr.Slider(
                             0.1, 1.0, 0.6, step=0.05,
@@ -662,14 +758,16 @@ with gr.Blocks(title="PuniGen") as demo:
                     # 今回の生成結果と過去の履歴を、同じ場所でサブタブとして切り替える。
                     # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
                     with gr.Tabs() as out_tabs:
-                        with gr.Tab("今回の結果", id="current") as cur_tab:
+                        with gr.Tab("今回の結果", id="current"):
+                            # ラベルは出さない。タブ見出し「今回の結果」と同じことになる
                             gallery = gr.Gallery(
-                                label="結果", columns=2, height=680, object_fit="contain",
+                                show_label=False, columns=2, height=680,
+                                object_fit="contain", elem_id="result_gallery",
                             )
-                        with gr.Tab("履歴", id="history") as hist_tab:
-                            hist_count = gr.Markdown("")
+                        with gr.Tab("履歴", id="history"):
+                            # ラベルは出さない。タブ見出し「履歴」と同じことになる
                             hist_gallery = gr.Gallery(
-                                label="生成履歴（クリックで選択）", columns=3, height=620,
+                                show_label=False, columns=3, height=620,
                                 object_fit="contain",
                             )
 
@@ -685,25 +783,24 @@ with gr.Blocks(title="PuniGen") as demo:
                             "", variant="secondary", scale=1,
                             elem_classes=FAV_CLASS,
                         )
-                    info = gr.Textbox(label="生成情報", interactive=False, lines=3)
+                    info = gr.Textbox(label="生成情報", interactive=False, lines=3,
+                                      elem_id="gen_info")
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
                     last_gen = gr.State(None)
+                    # 押された時点の操作対象。タブを先に切り替えても見失わないよう、
+                    # begin_job がここに確定した対象を入れて次の処理へ渡す
+                    job = gr.State(None)
                     picked = gr.State(None)
                     # 履歴側で選ばれている画像の条件と、いま開いているサブタブ
                     hist_sel = gr.State(None)
                     which_out = gr.State("current")
 
         with gr.Tab("お気に入り", id="favorites") as fav_tab:
-            gr.Markdown(
-                "生成タブで **★ お気に入り** を押した画像がここに集まります。"
-                "ファイルは `outputs/` から `favorites/` へ移動するので、"
-                "`outputs/` を整理しても消えません。"
-            )
-            fav_count = gr.Markdown("")
+            # ラベルは出さない。タブ見出し「お気に入り」と同じことになる
             fav_gallery = gr.Gallery(
-                label="お気に入り", columns=4, height=720, object_fit="contain"
+                show_label=False, columns=4, height=720, object_fit="contain"
             )
 
         with gr.Tab("モデルを追加", id="models"):
@@ -732,7 +829,7 @@ with gr.Blocks(title="PuniGen") as demo:
                 search_btn = gr.Button("検索", variant="primary", scale=0)
 
             results = gr.Gallery(
-                label="検索結果（クリックで選択）", columns=5, height=420,
+                label="検索結果", columns=5, height=420,
                 object_fit="cover", preview=False,
             )
             detail = gr.Markdown("")
@@ -745,8 +842,12 @@ with gr.Blocks(title="PuniGen") as demo:
     # お気に入りボタンの表示更新は多くの操作の後に走るので、引数をまとめておく
     _fav_args = ([which_out, last_gen, picked, hist_sel], favorite)
 
-    preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
-    model_dd.change(on_model_change, model_dd, preset_outputs)
+    preset_outputs = [prefix, negative, steps, cfg, sampler, clip_skip]
+    # ロード中の点滅を progress だけに閉じ込めるため、ロード（ジェネレータ）と
+    # 反映（通常の関数）を 2 段に分ける。失敗したらプリセットは入れないので .success
+    model_dd.change(on_model_load, model_dd, progress).success(
+        apply_preset, model_dd, preset_outputs
+    )
     refresh.click(lambda: gr.update(choices=list_checkpoints()), None, model_dd)
 
     token_save.click(civitai.save_token, token_box, token_status)
@@ -759,7 +860,7 @@ with gr.Blocks(title="PuniGen") as demo:
         on_generate,
         [model_dd, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
          in_image, strength],
-        [gallery, info, last_gen],
+        [gallery, progress, info, last_gen],
     ).then(lambda: None, None, picked).then(fav_button_state, *_fav_args)
     gallery.select(on_pick_result, None, picked).then(
         fav_button_state, *_fav_args
@@ -782,13 +883,18 @@ with gr.Blocks(title="PuniGen") as demo:
     # どちらのサブタブを開いているかを覚える。
     # Tabs の select が返す evt.value はラベル文字列なので、id と取り違えないよう
     # タブごとに定数を返す形にしている。
-    cur_tab.select(lambda: "current", None, which_out).then(
-        fav_button_state, [which_out, last_gen, picked, hist_sel], favorite
-    )
+    # 以前は gr.Tab ごとの select で受けていたが、「今回の結果」側は戻ってきても
+    # 発火しない。そのため履歴を一度開くと操作対象が history のまま戻らず、
+    # 今回の結果でお気に入りを押しても「履歴から画像を選んでください」になっていた
+    # （ブラウザで実測して確認）。Tabs 側の select は切り替えのたびに必ず発火する。
+    # evt.value はラベル文字列なので、順番の変わらない evt.index で判定する。
+    def _on_out_tab(evt: gr.SelectData):
+        if evt.index == 1:  # 履歴
+            return (*on_refresh_history(), "history")
+        return gr.skip(), gr.skip(), gr.skip(), "current"
 
-    hist_tab.select(
-        lambda: (*on_refresh_history(), "history"), None,
-        [hist_gallery, hist_count, hist_sel, info, which_out],
+    out_tabs.select(
+        _on_out_tab, None, [hist_gallery, hist_sel, info, which_out],
     ).then(fav_button_state, *_fav_args)
     hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
         fav_button_state, *_fav_args
@@ -796,44 +902,45 @@ with gr.Blocks(title="PuniGen") as demo:
     hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
 
     # --- 操作ボタン（1 組で両方のサブタブを兼ねる）---
-    # 再生成したら「今回の結果」へ切り替え、履歴一覧も更新する。
-    # 結果の表示場所を 1 か所に保ちつつ、履歴に新しい画像を反映させるため。
-    def _to_current():
-        return gr.Tabs(selected="current"), "current"
-
     _refresh_hist = (on_refresh_history, None,
-                     [hist_gallery, hist_count, hist_sel, info])
+                     [hist_gallery, hist_sel, info])
 
+    # 先に対象を確定してタブを切り替え、そのあとで生成に入る。
+    # 履歴に新しい画像を反映させるため、終わったら一覧も更新する
     variation.click(
-        on_variations_target, [which_out, last_gen, picked, hist_sel],
-        [gallery, info, last_gen],
-    ).then(_to_current, None, [out_tabs, which_out]).then(
-        lambda: None, None, picked
-    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+        begin_job, [which_out, last_gen, picked, hist_sel], [job, out_tabs, which_out],
+    ).then(
+        run_variations, job, [gallery, progress, info, last_gen],
+    ).then(lambda: None, None, picked).then(
+        fav_button_state, *_fav_args
+    ).then(*_refresh_hist)
 
     hires.click(
-        on_upscale_target, [which_out, last_gen, picked, hist_sel],
-        [gallery, info, last_gen],
-    ).then(_to_current, None, [out_tabs, which_out]).then(
-        lambda: None, None, picked
-    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+        begin_job, [which_out, last_gen, picked, hist_sel], [job, out_tabs, which_out],
+    ).then(
+        run_upscale, job, [gallery, progress, info, last_gen],
+    ).then(lambda: None, None, picked).then(
+        fav_button_state, *_fav_args
+    ).then(*_refresh_hist)
 
-    # お気に入りは画像が増えないのでサブタブは切り替えない
-    # 追加・解除で outputs と favorites の間を移動するので一覧は更新するが、
-    # 選択は保つ（続けて押し直せるようにするため）
+    # お気に入りは画像が増えないのでサブタブは切り替えない。
+    # 履歴一覧も貼り替えない。押した画像は outputs から favorites へ移るため、
+    # 貼り替えると以降が 1 つずつ繰り上がり、選択中の番号が別の画像を指してしまう。
+    # 実際、表示だけが別の絵に変わり、生成情報とちぐはぐになっていた。
+    # 履歴はサブタブを開き直したときに更新されるので、ここでは触らない。
     favorite.click(
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
-    ).then(fav_button_state, *_fav_args).then(
-        on_refresh_history_keep, None, [hist_gallery, hist_count]
-    )
+    ).then(fav_button_state, *_fav_args)
 
-    fav_tab.select(on_refresh_favorites, None, [fav_gallery, fav_count])
-    demo.load(on_refresh_favorites, None, [fav_gallery, fav_count])
+    fav_tab.select(on_refresh_favorites, None, fav_gallery)
+    demo.load(on_refresh_favorites, None, fav_gallery)
     # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
     stop.click(engine.request_cancel, None, None)
     if ckpts:
-        demo.load(on_model_change, model_dd, preset_outputs)
+        demo.load(on_model_load, model_dd, progress).success(
+            apply_preset, model_dd, preset_outputs
+        )
 
 demo.launch(
     inbrowser=True,

@@ -60,11 +60,19 @@ _model = None
 _lock = threading.Lock()
 
 
-def _ensure_weights() -> Path:
+def _say(on_phase, text: str) -> None:
+    """いま何を待っているかを画面へ伝える。コールバックが無ければ何もしない。"""
+    if on_phase is not None:
+        on_phase(text)
+
+
+def _ensure_weights(on_phase=None) -> Path:
     """モデルファイルを用意する。無ければ落とす。"""
     path = MODEL_DIR / MODEL_NAME
     if path.exists():
         return path
+    # 初回だけネットワーク待ちが入る。黙って止まると回線の問題と区別が付かない
+    _say(on_phase, "拡大用モデルをダウンロードしています... (初回のみ 約17MB)")
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     part = path.with_suffix(path.suffix + ".part")
     try:
@@ -86,7 +94,7 @@ def _ensure_weights() -> Path:
     return path
 
 
-def _load():
+def _load(on_phase=None):
     """モデルを読み込む。初回だけ時間がかかり、以後は使い回す。"""
     global _model
     if _model is not None:
@@ -96,7 +104,8 @@ def _load():
             return _model
         from spandrel import ModelLoader
 
-        path = _ensure_weights()
+        path = _ensure_weights(on_phase)
+        _say(on_phase, "拡大用モデルを読み込んでいます...")
         try:
             model = ModelLoader().load_from_file(str(path))
         except Exception as e:  # noqa: BLE001
@@ -228,9 +237,10 @@ def _run(model, x: torch.Tensor) -> torch.Tensor:
     return (acc / wsum.clamp_min(1e-6)).to(x.dtype)
 
 
-def upscale(img: Image.Image, scale: float = SCALE) -> Image.Image:
+def upscale(img: Image.Image, scale: float = SCALE, on_phase=None) -> Image.Image:
     """画像を scale 倍にする。描き込みは足さず、元の絵を保ったまま拡大する。"""
-    model = _load()
+    model = _load(on_phase)
+    _say(on_phase, "拡大しています...")
     dev = next(model.model.parameters()).device
     dtype = next(model.model.parameters()).dtype
 
