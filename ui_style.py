@@ -78,12 +78,21 @@ gradio-app {
     align-items: flex-end;
 }
 /* 中の 2 つは自前の枠・背景・影を持たない */
+/* 枠を描いているのは選択欄の .wrap。ここを外し忘れると、行の枠との二重になる
+   (Gradio の Dropdown は .block > .container > .wrap の入れ子で、
+    見えている枠は --input-border-color を持つ .wrap のもの) */
 #model_row .block,
 #model_row .form,
-#model_row .container {
+#model_row .container,
+#model_row .wrap {
     border: none;
     background: transparent;
     box-shadow: none;
+}
+/* 枠を行へ移したぶん、フォーカスの表示も行で受ける */
+#model_row:focus-within {
+    border-color: var(--input-border-color-focus, var(--color-accent, #f97316));
+    box-shadow: var(--input-shadow-focus, none);
 }
 /* 選択欄の下端を行の下端に一致させる。これでボタンと高さが揃う */
 #model_row .block {
