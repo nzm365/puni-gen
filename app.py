@@ -746,7 +746,8 @@ with gr.Blocks(title="PuniGen") as demo:
                         with gr.Tab("今回の結果", id="current"):
                             # ラベルは出さない。タブ見出し「今回の結果」と同じことになる
                             gallery = gr.Gallery(
-                                show_label=False, columns=2, height=680, object_fit="contain",
+                                show_label=False, columns=2, height=680,
+                                object_fit="contain", elem_id="result_gallery",
                             )
                         with gr.Tab("履歴", id="history"):
                             # ラベルは出さない。タブ見出し「履歴」と同じことになる
@@ -767,7 +768,8 @@ with gr.Blocks(title="PuniGen") as demo:
                             "", variant="secondary", scale=1,
                             elem_classes=FAV_CLASS,
                         )
-                    info = gr.Textbox(label="生成情報", interactive=False, lines=3)
+                    info = gr.Textbox(label="生成情報", interactive=False, lines=3,
+                                      elem_id="gen_info")
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号

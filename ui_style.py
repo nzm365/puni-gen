@@ -128,9 +128,15 @@ gradio-app {
 }
 
 /* Gradio はジェネレータの実行中、出力コンポーネントの枠を 2 秒周期で点滅させる
-   (statustracker の .generating)。この行はバー自体が動いているので枠は情報を足さず、
-   二重に主張してうるさいだけなので止める */
-#progress_line .generating {
+   (statustracker の .generating: 2px の枠 + 明滅)。
+   生成の進み具合はこの進捗バーが受け持っているので、同じことを枠の明滅でも
+   主張されると二重になる。特に「生成情報」は生成中は空のまま光り、
+   結果ギャラリーは大きな橙の矩形になって、進捗バーと離れた位置で目立ってしまう。
+   バーが受け持つ 3 つだけ明滅を止める。検索結果のように、バーが無くて
+   この明滅が唯一の反応になる箇所はそのまま残す */
+#progress_line .generating,
+#result_gallery .generating,
+#gen_info .generating {
     border: none !important;
     animation: none !important;
 }
