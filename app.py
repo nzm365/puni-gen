@@ -43,6 +43,16 @@ def _bar(text: str, frac: float | None = None) -> str:
     return f'<div class="pg"><div class="pg-text">{body}</div>{track}</div>'
 
 
+def _done(text: str) -> str:
+    """完了の表示。バーを満杯のまま残す。
+
+    終わった瞬間に消すと、待たされていた人には「結局どうなったのか」が
+    残らない。次の操作で置き換わるまで、終わったことを見えるままにする。
+    """
+    return (f'<div class="pg pg-done"><div class="pg-text">{html.escape(text)}</div>'
+            '<div class="pg-track"><div class="pg-fill" style="width:100%"></div></div></div>')
+
+
 def _note(text: str) -> str:
     """バーを出さない一言（中止しました、先に生成してください、など）。"""
     return f'<div class="pg pg-note"><div class="pg-text">{html.escape(text)}</div></div>'
@@ -103,7 +113,7 @@ def on_model_load(ckpt):
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
     # 待ちが終わったので進捗行を消し、確定した状態は State に預けて次へ渡す
-    yield "", res["msg"]
+    yield _done("読み込み完了"), res["msg"]
 
 
 def apply_preset(ckpt, load_msg):
@@ -206,7 +216,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
                      sampler, int(clip_skip), seed, n)
         hit = RESULT_CACHE.get(cache_key)
         if hit is not None:
-            yield (hit[0], "", hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
+            yield (hit[0], _done("生成完了"), hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
             return
 
     # 生成はワーカースレッドで回し、ここでは途中経過を受け取って画面に流す
@@ -280,7 +290,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         RESULT_CACHE[cache_key] = (images, info, last)
         while len(RESULT_CACHE) > 8:
             RESULT_CACHE.popitem(last=False)
-    yield gr.update(value=images, selected_index=None), "", info, last
+    yield gr.update(value=images, selected_index=None), _done("生成完了"), info, last
 
 
 # ---------- 高解像度化 (Hires.fix) ----------
@@ -344,7 +354,7 @@ def on_upscale(last, idx):
         f"file: {path.name}"
     )
     nxt = {**last, "images": out, "paths": [str(path)], "seeds": [seed]}
-    yield gr.update(value=out, selected_index=None), "", info, nxt
+    yield gr.update(value=out, selected_index=None), _done("拡大完了"), info, nxt
 
 
 # ---------- お気に入り ----------
@@ -500,7 +510,7 @@ def on_variations(last, idx):
         "paths": [str(p) for p in paths],
         "seeds": [base_seed] * len(out),
     }
-    yield gr.update(value=out, selected_index=None), "", info, nxt
+    yield gr.update(value=out, selected_index=None), _done("完了"), info, nxt
 
 
 # ---------- 生成履歴 ----------

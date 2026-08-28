@@ -79,24 +79,31 @@ gradio-app {
     background: transparent;
     box-shadow: none;
 }
-/* 再読み込みボタン。文字 1 つぶんの正方形に近い形まで詰める */
+/* 再読み込みボタン。幅は文字 1 つぶんまで詰めるが、枠と地色は残す。
+   枠なしにすると、ただの記号に見えて押せることが伝わらなかった */
 #model_row button {
     min-width: 0;
-    width: 2.2rem;
-    flex: 0 0 2.2rem;
+    width: 2.3rem;
+    height: 2.1rem;
+    flex: 0 0 2.3rem;
     padding: 0;
-    border: none;
-    background: transparent;
-    box-shadow: none;
-    color: var(--body-text-color-subdued, #71717a);
+    border: 1px solid var(--button-secondary-border-color, var(--border-color-primary, #d4d4d8));
+    border-radius: var(--radius-sm, 6px);
+    background: var(--button-secondary-background-fill, #f4f4f5);
+    box-shadow: var(--shadow-drop, 0 1px 2px rgb(0 0 0 / 8%));
+    color: var(--body-text-color, #27272a);
     font-size: 1.05rem;
     line-height: 1;
     cursor: pointer;
 }
 #model_row button:hover {
-    color: var(--body-text-color, #27272a);
-    background: var(--background-fill-secondary, #f4f4f5);
-    border-radius: var(--radius-sm, 4px);
+    background: var(--button-secondary-background-fill-hover, #e4e4e7);
+    border-color: var(--body-text-color-subdued, #a1a1aa);
+}
+/* 押した瞬間に沈める。反応があったことを触感として返す */
+#model_row button:active {
+    transform: translateY(1px);
+    box-shadow: none;
 }
 
 /* ---- 進捗バー ----
@@ -149,6 +156,20 @@ gradio-app {
     from { transform: translateX(0) scaleX(1); }
     50%  { transform: translateX(106%) scaleX(1.35); }
     to   { transform: translateX(212%) scaleX(1); }
+}
+
+/* 終わったあと。満杯のバーを緑にして残す。
+   消してしまうと、待たされていた人に結果が残らない */
+#progress_line .pg-done .pg-fill {
+    background: linear-gradient(90deg, #86efac, #22c55e);
+}
+#progress_line .pg-done .pg-text {
+    color: var(--body-text-color, #27272a);
+}
+#progress_line .pg-done .pg-text::before {
+    content: "✓ ";
+    color: #22c55e;
+    font-weight: 700;
 }
 
 /* 一言だけのとき（中止しました、など）はバーを出さない */
