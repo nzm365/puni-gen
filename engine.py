@@ -232,21 +232,21 @@ class Engine:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
 
-    def _wait_note(self, next_action: str) -> str:
-        """ロック待ちの文言。何を待っているのかと、終わったら何をするのかを両方出す。
+    def _wait_note(self) -> str:
+        """ロック待ちの文言。何を待っているのかを名指しする。
 
         ただ「他の処理」とだけ書くと、待たされている側からは何が起きているのか
         分からない。特にウォームアップは画面に出ない裏の処理なので、
         名前を出さないと理由の分からない待ちになる。
         """
-        return f"{self._busy or '別の処理'}が終わるのを待っています... (終わり次第{next_action})"
+        return f"{self._busy or '別の処理'}が終わるのを待っています..."
 
     # ---------- モデル ----------
     def load(self, ckpt_name: str, on_phase=None) -> str:
         # ロックが空いていないときだけ待機中と伝える。生成中にモデルを切り替えると
         # ここで数十秒待つが、黙って止まって見えると固まったと誤解される
         if not self._lock.acquire(blocking=False):
-            _say(on_phase, self._wait_note("モデルを読み込みます"))
+            _say(on_phase, self._wait_note())
             self._lock.acquire()
         self._busy = "モデルの読み込み"
         try:
@@ -258,14 +258,13 @@ class Engine:
     def _load_impl(self, ckpt_name: str, on_phase=None) -> str:
         if self.current == ckpt_name and self.pipe is not None:
             return f"already loaded: {ckpt_name}"
-        _say(on_phase, f"モデルを準備しています: {ckpt_name}")
         self.unload()
         path = CKPT_DIR / ckpt_name
         _say(on_phase, "空き VRAM を確認しています...")
         offload, mode = self._plan(path)  # 載らないと分かればここで例外
         # ここが全体で最も長い。6GB 級のファイルを読むので数十秒かかる
         gb = path.stat().st_size / 1024**3
-        _say(on_phase, f"重みを読み込んでいます... ({gb:.1f}GB / 初回は 1 分ほどかかります)")
+        _say(on_phase, f"重みを読み込んでいます... ({gb:.1f}GB)")
         pipe = StableDiffusionXLPipeline.from_single_file(
             str(path), torch_dtype=torch.float16, use_safetensors=True
         )
@@ -588,14 +587,14 @@ class Engine:
                         vae.to(alt)
                         name = "bf16" if alt == torch.bfloat16 else "fp32"
                         print(f"[vae] {self.current}: fp16 デコードが NaN/Inf を出したため {name} に切替")
-                        _say(on_phase, f"このモデルは {name} が必要でした。変換をやり直しています...")
+                        _say(on_phase, f"{name} で変換をやり直しています...")
                     else:
                         # bf16 でも NaN (理論上ほぼ起きない)。最後の砦の fp32 + タイル分割へ
                         vae.to(torch.float32)
                         vae.enable_tiling()
                         self._vae_force_tiling = True
                         print(f"[vae] {self.current}: bf16 でも NaN/Inf のため fp32 (タイル分割) に切替")
-                        _say(on_phase, "変換をやり直しています... (安全な設定に切り替え)")
+                        _say(on_phase, "変換をやり直しています...")
 
                     continue
             except torch.cuda.OutOfMemoryError:
@@ -784,7 +783,7 @@ class Engine:
     def generate(self, *args, on_phase=None, **kwargs):
         # 生成も直列化する。二重クリック等で 2 つ同時に走ると作業メモリが倍増して溢れる
         if not self._lock.acquire(blocking=False):
-            _say(on_phase, self._wait_note("生成を始めます"))
+            _say(on_phase, self._wait_note())
             self._lock.acquire()
         self._busy = "画像の生成"
         try:

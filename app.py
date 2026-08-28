@@ -251,7 +251,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
             continue
         _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, _bar(f"生成中... {s}/{total} step（途中プレビュー）", s / total), gr.skip(), gr.skip()
+            yield imgs, _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
         else:
             yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
@@ -481,7 +481,7 @@ def on_variations(last, idx):
             continue
         _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, _bar(f"変分を生成中... {s}/{total} step（途中プレビュー）", s / total), gr.skip(), gr.skip()
+            yield imgs, _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
         else:
             yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
@@ -510,7 +510,7 @@ def on_variations(last, idx):
         "paths": [str(p) for p in paths],
         "seeds": [base_seed] * len(out),
     }
-    yield gr.update(value=out, selected_index=None), _done("完了"), info, nxt
+    yield gr.update(value=out, selected_index=None), _done("生成完了"), info, nxt
 
 
 # ---------- 生成履歴 ----------
