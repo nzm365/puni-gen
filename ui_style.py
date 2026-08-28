@@ -1,6 +1,6 @@
 """画面まわりの CSS（Gradio の launch(css=...) に渡す）。
 
-やっていることは 2 つ。
+やっていることは 3 つ。
 
 1. 表示倍率を下げる
    Gradio の既定は余白も文字も大きめで、フル HD だとページ全体が 1070px になり
@@ -15,6 +15,11 @@
    Gradio のボタンはラベルの HTML をエスケープするので SVG を直接は埋め込めない
    （試したところ、タグがそのまま文字として表示された）。
    そこで app.py 側は状態をクラス名で伝えるだけにし、星はここで背景画像として描く。
+
+3. 進捗の 1 行を「進行中の表示」として見せる
+   ただの本文と同じ見た目だと、待たされている最中の案内だと分からない。
+   左に色帯を付けて他の文字と区別する。中身が空のときは <p> 自体が無いので、
+   何も待っていないときは高さを持たず場所も取らない。
 """
 from __future__ import annotations
 
@@ -45,6 +50,21 @@ CSS = """
    フル HD で縦スクロールを出さずに収めるための調整。 */
 gradio-app {
     zoom: __ZOOM__%;
+}
+
+/* ---- 進捗の 1 行 ----
+   app.py の progress（ギャラリー直上）専用。「いま何をしているか」はここだけに出る。
+   空文字を入れると <p> ごと消えるので、待ちが無いときは行が畳まれる。 */
+#progress_line {
+    min-height: 0;
+}
+#progress_line p {
+    margin: 0 0 6px;
+    padding: 6px 10px;
+    border-left: 3px solid var(--color-accent, #f97316);
+    background: var(--background-fill-secondary);
+    border-radius: 4px;
+    font-size: 0.92em;
 }
 
 /* ---- お気に入りボタンの星 ----

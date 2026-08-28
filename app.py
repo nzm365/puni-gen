@@ -52,7 +52,7 @@ def on_model_change(ckpt):
     engine から届く段階表示をそのまま status に流す。
     """
     if not ckpt:
-        yield (gr.update(),) * 7
+        yield (gr.update(),) * 8
         return
 
     q: queue.Queue = queue.Queue()
@@ -67,7 +67,8 @@ def on_model_change(ckpt):
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    _hold = (gr.skip(),) * 6  # ロード中はプリセット欄に触らない
+    # ロード中は status もプリセット欄も触らない。動いている印は progress だけに出す
+    _hold = (gr.skip(),) * 7
     yield ("モデルを準備しています...", *_hold)
     while (text := q.get()) is not None:
         yield (text, *_hold)
@@ -79,7 +80,8 @@ def on_model_change(ckpt):
     # ユーザーがプロンプトを打っている間に、裏で 1 step 回して初回のもたつきを消す
     threading.Thread(target=engine.warmup, args=tuple(p["size"]), daemon=True).start()
     yield (
-        res["msg"],
+        "",            # 待ちが終わったので進捗行は消す
+        res["msg"],    # 確定したモデルの状態は左に残す
         p["prefix_pos"],
         p["default_neg"],
         p["steps"],
@@ -168,7 +170,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
                      sampler, int(clip_skip), seed, n)
         hit = RESULT_CACHE.get(cache_key)
         if hit is not None:
-            yield (hit[0], hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
+            yield (hit[0], "", hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
             return
 
     # 生成はワーカースレッドで回し、ここでは途中経過を受け取って画面に流す
@@ -196,23 +198,23 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
     threading.Thread(target=worker, daemon=True).start()
     # 前回の結果を残したままだと「生成中」の表示と一緒に前の絵が見え、
     # それが今まさに生成中の絵だと誤解される。開始時点で必ず空にする
-    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip()
+    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip(), gr.skip()
     while (msg := q.get()) is not None:
         if msg[0] == "phase":
-            yield gr.update(), msg[1], gr.skip()
+            yield gr.update(), msg[1], gr.skip(), gr.skip()
             continue
         _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, f"生成中... {s}/{total} step（途中プレビュー）", gr.skip()
+            yield imgs, f"生成中... {s}/{total} step（途中プレビュー）", gr.skip(), gr.skip()
         else:
-            yield gr.update(), f"生成中... {s}/{total} step", gr.skip()
+            yield gr.update(), f"生成中... {s}/{total} step", gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
 
     images, used_seed, perf = res["out"]
     if images is None:  # 中止された
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip()
+        yield gr.update(), "中止しました（画像は保存されません）", gr.skip(), gr.skip()
         return
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -242,7 +244,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         RESULT_CACHE[cache_key] = (images, info, last)
         while len(RESULT_CACHE) > 8:
             RESULT_CACHE.popitem(last=False)
-    yield gr.update(value=images, selected_index=None), info, last
+    yield gr.update(value=images, selected_index=None), "", info, last
 
 
 # ---------- 高解像度化 (Hires.fix) ----------
@@ -259,7 +261,7 @@ def on_upscale(last, idx):
     engine.upscale 側の実装は残してあるので、戻したくなれば差し替えられる。
     """
     if not last or not last.get("images"):
-        yield gr.update(), "先に画像を生成してください。", gr.skip()
+        yield gr.update(), "先に画像を生成してください。", gr.skip(), gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
@@ -267,7 +269,7 @@ def on_upscale(last, idx):
     seeds = last.get("seeds") or []
     seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
-    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip()
+    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip(), gr.skip()
 
     q: queue.Queue = queue.Queue()
     res = {}
@@ -284,7 +286,7 @@ def on_upscale(last, idx):
 
     threading.Thread(target=worker, daemon=True).start()
     while (text := q.get()) is not None:
-        yield gr.update(), text, gr.skip()
+        yield gr.update(), text, gr.skip(), gr.skip()
 
     if "err" in res:
         e = res["err"]
@@ -306,7 +308,7 @@ def on_upscale(last, idx):
         f"file: {path.name}"
     )
     nxt = {**last, "images": out, "paths": [str(path)], "seeds": [seed]}
-    yield gr.update(value=out, selected_index=None), info, nxt
+    yield gr.update(value=out, selected_index=None), "", info, nxt
 
 
 # ---------- お気に入り ----------
@@ -399,7 +401,7 @@ def on_refresh_favorites():
 def on_variations(last, idx):
     """選択中の画像の seed を保ったまま、少しだけ違う絵を 4 枚出す。"""
     if not last or not last.get("images"):
-        yield gr.update(), "先に画像を生成してください。", gr.skip()
+        yield gr.update(), "先に画像を生成してください。", gr.skip(), gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
@@ -426,23 +428,23 @@ def on_variations(last, idx):
 
     threading.Thread(target=worker, daemon=True).start()
     # 選択も解除する（前の絵を選んだままだと新しい結果と対応がずれる）
-    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip()
+    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip(), gr.skip()
     while (msg := q.get()) is not None:
         if msg[0] == "phase":
-            yield gr.update(), msg[1], gr.skip()
+            yield gr.update(), msg[1], gr.skip(), gr.skip()
             continue
         _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, f"変分を生成中... {s}/{total} step（途中プレビュー）", gr.skip()
+            yield imgs, f"変分を生成中... {s}/{total} step（途中プレビュー）", gr.skip(), gr.skip()
         else:
-            yield gr.update(), f"変分を生成中... {s}/{total} step", gr.skip()
+            yield gr.update(), f"変分を生成中... {s}/{total} step", gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
 
     out, _, perf = res["out"]
     if out is None:
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip()
+        yield gr.update(), "中止しました（画像は保存されません）", gr.skip(), gr.skip()
         return
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -462,7 +464,7 @@ def on_variations(last, idx):
         "paths": [str(p) for p in paths],
         "seeds": [base_seed] * len(out),
     }
-    yield gr.update(value=out, selected_index=None), info, nxt
+    yield gr.update(value=out, selected_index=None), "", info, nxt
 
 
 # ---------- 生成履歴 ----------
@@ -583,7 +585,7 @@ def fav_button_state(which, last, picked, hist_sel):
 def on_variations_target(which, last, picked, hist_sel):
     state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
-        yield gr.update(), msg, gr.skip()
+        yield gr.update(), msg, gr.skip(), gr.skip()
         return
     yield from on_variations(state, idx)
 
@@ -591,7 +593,7 @@ def on_variations_target(which, last, picked, hist_sel):
 def on_upscale_target(which, last, picked, hist_sel):
     state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
-        yield gr.update(), msg, gr.skip()
+        yield gr.update(), msg, gr.skip(), gr.skip()
         return
     yield from on_upscale(state, idx)
 
@@ -697,6 +699,12 @@ with gr.Blocks(title="PuniGen") as demo:
                             seed = gr.Number(-1, label="Seed (-1 でランダム)", precision=0)
 
                 with gr.Column(scale=1):
+                    # 進行中のことだけを出す 1 行。空にすると行ごと消えるので、
+                    # 待ちが無いときは場所を取らない。
+                    # 「いま何をしているか」の置き場はここ 1 箇所に限る。
+                    # モデルの確定状態は左の status、完成した絵の情報は下の info と
+                    # 役割を分け、同じ文言が 2 箇所に出ないようにしている
+                    progress = gr.Markdown("", elem_id="progress_line")
                     # 今回の生成結果と過去の履歴を、同じ場所でサブタブとして切り替える。
                     # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
                     with gr.Tabs() as out_tabs:
@@ -783,7 +791,7 @@ with gr.Blocks(title="PuniGen") as demo:
     # お気に入りボタンの表示更新は多くの操作の後に走るので、引数をまとめておく
     _fav_args = ([which_out, last_gen, picked, hist_sel], favorite)
 
-    preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
+    preset_outputs = [progress, status, prefix, negative, steps, cfg, sampler, clip_skip]
     model_dd.change(on_model_change, model_dd, preset_outputs)
     refresh.click(lambda: gr.update(choices=list_checkpoints()), None, model_dd)
 
@@ -797,7 +805,7 @@ with gr.Blocks(title="PuniGen") as demo:
         on_generate,
         [model_dd, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
          in_image, strength],
-        [gallery, info, last_gen],
+        [gallery, progress, info, last_gen],
     ).then(lambda: None, None, picked).then(fav_button_state, *_fav_args)
     gallery.select(on_pick_result, None, picked).then(
         fav_button_state, *_fav_args
@@ -844,14 +852,14 @@ with gr.Blocks(title="PuniGen") as demo:
 
     variation.click(
         on_variations_target, [which_out, last_gen, picked, hist_sel],
-        [gallery, info, last_gen],
+        [gallery, progress, info, last_gen],
     ).then(_to_current, None, [out_tabs, which_out]).then(
         lambda: None, None, picked
     ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
 
     hires.click(
         on_upscale_target, [which_out, last_gen, picked, hist_sel],
-        [gallery, info, last_gen],
+        [gallery, progress, info, last_gen],
     ).then(_to_current, None, [out_tabs, which_out]).then(
         lambda: None, None, picked
     ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
