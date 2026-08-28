@@ -1,6 +1,6 @@
 """画面まわりの CSS（Gradio の launch(css=...) に渡す）。
 
-やっていることは 3 つ。
+やっていることは 4 つ。
 
 1. 表示倍率を下げる
    Gradio の既定は余白も文字も大きめで、フル HD だとページ全体が 1070px になり
@@ -23,6 +23,11 @@
    往復の折り返しで横に伸び縮みさせているのは、PuniGen の名前のとおり
    柔らかい印象にするため（縞模様も試したが、角が立って固い見た目になった）。
    app.py が中身を空にすると要素ごと消えるので、待ちが無いときは場所を取らない。
+
+4. モデル選択と再読み込みボタンを 1 つの枠に見せる
+   Gradio はコンポーネントごとに枠を描くので、素直に並べると枠が 2 つできる。
+   行 (#model_row) に枠を移し、中の 2 つからは枠と背景を外す。
+   ボタンは幅を詰めて、選択欄の右端に収まるようにする。
 """
 from __future__ import annotations
 
@@ -53,6 +58,45 @@ CSS = """
    フル HD で縦スクロールを出さずに収めるための調整。 */
 gradio-app {
     zoom: __ZOOM__%;
+}
+
+/* ---- モデル選択 + 再読み込みボタン ----
+   枠を行に移し、中身は枠なしにして、1 つの入力欄の中にボタンがあるように見せる。 */
+#model_row {
+    border: 1px solid var(--block-border-color, var(--border-color-primary, #d4d4d8));
+    border-radius: var(--block-radius, 8px);
+    background: var(--block-background-fill, transparent);
+    padding-right: var(--size-1, 4px);
+    gap: 0;
+    flex-wrap: nowrap;
+    align-items: center;
+}
+/* 中の 2 つは自前の枠・背景・影を持たない */
+#model_row .block,
+#model_row .form,
+#model_row .container {
+    border: none;
+    background: transparent;
+    box-shadow: none;
+}
+/* 再読み込みボタン。文字 1 つぶんの正方形に近い形まで詰める */
+#model_row button {
+    min-width: 0;
+    width: 2.2rem;
+    flex: 0 0 2.2rem;
+    padding: 0;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    color: var(--body-text-color-subdued, #71717a);
+    font-size: 1.05rem;
+    line-height: 1;
+    cursor: pointer;
+}
+#model_row button:hover {
+    color: var(--body-text-color, #27272a);
+    background: var(--background-fill-secondary, #f4f4f5);
+    border-radius: var(--radius-sm, 4px);
 }
 
 /* ---- 進捗バー ----

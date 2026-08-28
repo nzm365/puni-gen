@@ -695,11 +695,14 @@ with gr.Blocks(title="PuniGen") as demo:
             # 左に操作系、右に生成結果。縦に伸ばさず 1 画面に収める
             with gr.Row(equal_height=False):
                 with gr.Column(scale=1):
-                    with gr.Row():
+                    # 枠は行そのものに描き、中の 2 つは枠を持たない（CSS 側で指定）。
+                    # 見た目としては、モデル選択の枠の中に再読み込みボタンが入る
+                    with gr.Row(elem_id="model_row"):
                         model_dd = gr.Dropdown(
                             ckpts, value=ckpts[0] if ckpts else None, label="モデル", scale=4
                         )
-                        refresh = gr.Button("↻", scale=0)
+                        # min_width を切らないと、Gradio の既定でボタンが横に広がる
+                        refresh = gr.Button("↻", scale=0, min_width=0)
                     status = gr.Markdown("")
                     # 進行中のことだけを出す 1 行。status のすぐ下に置く。
                     # 空にすると行ごと消えるので、待ちが無いときは場所を取らない。
