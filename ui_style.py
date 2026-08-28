@@ -37,7 +37,7 @@ UI_ZOOM = 90
 # 再読み込みボタンの高さ。選択欄の高さに合わせる値。
 # 選択欄の高さは --checkbox-label-padding（テーマ側で決まり、CSS ファイルからは
 # 読めない）に依存するため計算では出せない。ここだけ実測で合わせる
-REFRESH_BTN_HEIGHT = "32px"
+REFRESH_BTN_HEIGHT = "42px"
 
 # 星の形。角を少し丸めて、フォントの ★ より柔らかい印象にしている
 _STAR_PATH = (
@@ -82,7 +82,9 @@ gradio-app {
     border: none;
     background: transparent;
     box-shadow: none;
-    padding-bottom: 0;
+    /* 上だけ残す。ラベル「モデル」の上の余白はこれ。左右と下を 0 にすると
+       選択欄の枠が行の端まで届き、ボタンとの間隔が gap だけになる */
+    padding: var(--block-padding, 10px) 0 0 0;
 }
 
 /* 再読み込みボタン。幅は文字 1 つぶんまで詰め、高さは選択欄に合わせる。
