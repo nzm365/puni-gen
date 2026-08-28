@@ -440,7 +440,7 @@ def on_favorite(last, idx):
 
 def on_refresh_favorites():
     files = list_favorites()
-    return gr.update(value=files), f"{len(files)} 枚"
+    return gr.update(value=files)
 
 
 # ---------- この絵の続き（変分） ----------
@@ -529,7 +529,7 @@ def on_refresh_history():
     せっかく出た結果を消さないよう触らない（gr.skip）。
     """
     files = list_history()
-    return gr.update(value=files), f"{len(files)} 枚", None, gr.skip()
+    return gr.update(value=files), None, gr.skip()
 
 
 def on_refresh_history_keep():
@@ -540,7 +540,7 @@ def on_refresh_history_keep():
     出てしまう（実際にそうなっていた）。
     """
     files = list_history()
-    return gr.update(value=files), f"{len(files)} 枚"
+    return gr.update(value=files)
 
 
 def on_pick_history(evt: gr.SelectData):
@@ -734,7 +734,7 @@ with gr.Blocks(title="PuniGen") as demo:
 
                     with gr.Accordion("img2img（画像を置くと、その画像を下敷きに生成）", open=False):
                         in_image = gr.Image(
-                            type="pil", label="入力画像（空なら通常の txt2img）", height=280
+                            type="pil", label="入力画像", height=280
                         )
                         strength = gr.Slider(
                             0.1, 1.0, 0.6, step=0.05,
@@ -755,13 +755,14 @@ with gr.Blocks(title="PuniGen") as demo:
                     # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
                     with gr.Tabs() as out_tabs:
                         with gr.Tab("今回の結果", id="current") as cur_tab:
+                            # ラベルは出さない。タブ見出し「今回の結果」と同じことになる
                             gallery = gr.Gallery(
-                                label="結果", columns=2, height=680, object_fit="contain",
+                                show_label=False, columns=2, height=680, object_fit="contain",
                             )
                         with gr.Tab("履歴", id="history") as hist_tab:
-                            hist_count = gr.Markdown("")
+                            # ラベルは出さない。タブ見出し「履歴」と同じことになる
                             hist_gallery = gr.Gallery(
-                                label="生成履歴（クリックで選択）", columns=3, height=620,
+                                show_label=False, columns=3, height=620,
                                 object_fit="contain",
                             )
 
@@ -788,14 +789,9 @@ with gr.Blocks(title="PuniGen") as demo:
                     which_out = gr.State("current")
 
         with gr.Tab("お気に入り", id="favorites") as fav_tab:
-            gr.Markdown(
-                "生成タブで **★ お気に入り** を押した画像がここに集まります。"
-                "ファイルは `outputs/` から `favorites/` へ移動するので、"
-                "`outputs/` を整理しても消えません。"
-            )
-            fav_count = gr.Markdown("")
+            # ラベルは出さない。タブ見出し「お気に入り」と同じことになる
             fav_gallery = gr.Gallery(
-                label="お気に入り", columns=4, height=720, object_fit="contain"
+                show_label=False, columns=4, height=720, object_fit="contain"
             )
 
         with gr.Tab("モデルを追加", id="models"):
@@ -824,7 +820,7 @@ with gr.Blocks(title="PuniGen") as demo:
                 search_btn = gr.Button("検索", variant="primary", scale=0)
 
             results = gr.Gallery(
-                label="検索結果（クリックで選択）", columns=5, height=420,
+                label="検索結果", columns=5, height=420,
                 object_fit="cover", preview=False,
             )
             detail = gr.Markdown("")
@@ -884,7 +880,7 @@ with gr.Blocks(title="PuniGen") as demo:
 
     hist_tab.select(
         lambda: (*on_refresh_history(), "history"), None,
-        [hist_gallery, hist_count, hist_sel, info, which_out],
+        [hist_gallery, hist_sel, info, which_out],
     ).then(fav_button_state, *_fav_args)
     hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
         fav_button_state, *_fav_args
@@ -898,7 +894,7 @@ with gr.Blocks(title="PuniGen") as demo:
         return gr.Tabs(selected="current"), "current"
 
     _refresh_hist = (on_refresh_history, None,
-                     [hist_gallery, hist_count, hist_sel, info])
+                     [hist_gallery, hist_sel, info])
 
     variation.click(
         on_variations_target, [which_out, last_gen, picked, hist_sel],
@@ -921,11 +917,11 @@ with gr.Blocks(title="PuniGen") as demo:
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
     ).then(fav_button_state, *_fav_args).then(
-        on_refresh_history_keep, None, [hist_gallery, hist_count]
+        on_refresh_history_keep, None, hist_gallery
     )
 
-    fav_tab.select(on_refresh_favorites, None, [fav_gallery, fav_count])
-    demo.load(on_refresh_favorites, None, [fav_gallery, fav_count])
+    fav_tab.select(on_refresh_favorites, None, fav_gallery)
+    demo.load(on_refresh_favorites, None, fav_gallery)
     # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
     stop.click(engine.request_cancel, None, None)
     if ckpts:
