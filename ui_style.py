@@ -24,15 +24,20 @@
    柔らかい印象にするため（縞模様も試したが、角が立って固い見た目になった）。
    app.py が中身を空にすると要素ごと消えるので、待ちが無いときは場所を取らない。
 
-4. モデル選択と再読み込みボタンを 1 つの枠に見せる
-   Gradio はコンポーネントごとに枠を描くので、素直に並べると枠が 2 つできる。
-   行 (#model_row) に枠を移し、中の 2 つからは枠と背景を外す。
-   ボタンは幅を詰めて、選択欄の右端に収まるようにする。
+4. モデル選択と再読み込みボタンを 1 つの入力グループに見せる
+   Dropdown が自分で描く枠は「ドロップダウンだ」と分かるための枠なので消さない。
+   行にもう 1 つ枠を足すと二重になるので、行は枠を持たず、
+   ボタンを選択欄の右へ密着させて、まとまった 1 つの部品に見せる。
 """
 from __future__ import annotations
 
 # 表示倍率。ブラウザのズーム率と同じ意味で、下げるほど一度に見える量が増える
 UI_ZOOM = 90
+
+# 再読み込みボタンの高さ。選択欄の高さに合わせる値。
+# 選択欄の高さは --checkbox-label-padding（テーマ側で決まり、CSS ファイルからは
+# 読めない）に依存するため計算では出せない。ここだけ実測で合わせる
+REFRESH_BTN_HEIGHT = "32px"
 
 # 星の形。角を少し丸めて、フォントの ★ より柔らかい印象にしている
 _STAR_PATH = (
@@ -61,66 +66,44 @@ gradio-app {
 }
 
 /* ---- モデル選択 + 再読み込みボタン ----
-   枠を行に移し、中身は枠なしにして、1 つの入力欄の中にボタンがあるように見せる。 */
+   Gradio の Dropdown は .container .wrap が枠を描く。これが「ドロップダウンだ」と
+   分かるための枠なので消さない。行に別の枠を足すと二重になるため、行は枠を持たず、
+   ボタンを選択欄の右へ密着させて 1 つの入力グループに見せる。 */
 #model_row {
-    border: 1px solid var(--block-border-color, var(--border-color-primary, #d4d4d8));
-    border-radius: var(--block-radius, 8px);
-    background: var(--block-background-fill, transparent);
-    /* 下の余白は行側に持たせる。align-items: flex-end なので選択欄とボタンは
-       この余白の上で下端がそろい、囲いの内側にも同じだけ空きができる */
-    padding: 0 var(--size-1, 4px) var(--block-padding, 8px) 0;
-    /* 囲いと次の入力欄の間にも間隔を空ける */
-    margin-bottom: var(--size-2, 8px);
-    gap: 0;
+    gap: var(--spacing-sm, 4px);
     flex-wrap: nowrap;
-    /* 中央ではなく下端に揃える。選択欄の上には「モデル」のラベルがあるので、
-       中央だとボタンだけがラベルのぶん浮いて見える */
+    /* ラベル「モデル」のぶん選択欄は下寄りにあるので、下端で揃える */
     align-items: flex-end;
+    margin-bottom: var(--size-2, 8px);
 }
-/* 中の 2 つは自前の枠・背景・影を持たない */
-/* 枠を描いているのは選択欄の .wrap。ここを外し忘れると、行の枠との二重になる
-   (Gradio の Dropdown は .block > .container > .wrap の入れ子で、
-    見えている枠は --input-border-color を持つ .wrap のもの) */
+/* 行の中の入れ物は余白と枠を持たない。枠は .wrap だけが持つ */
 #model_row .block,
-#model_row .form,
-#model_row .container,
-#model_row .wrap {
+#model_row .form {
     border: none;
     background: transparent;
     box-shadow: none;
-}
-/* 枠を行へ移したぶん、フォーカスの表示も行で受ける */
-#model_row:focus-within {
-    border-color: var(--input-border-color-focus, var(--color-accent, #f97316));
-    box-shadow: var(--input-shadow-focus, none);
-}
-/* 選択欄の下端を行の下端に一致させる。これでボタンと高さが揃う */
-#model_row .block {
     padding-bottom: 0;
 }
-/* 再読み込みボタン。幅は文字 1 つぶんまで詰めるが、枠と地色は残す。
-   枠なしにすると、ただの記号に見えて押せることが伝わらなかった */
+
+/* 再読み込みボタン。幅は文字 1 つぶんまで詰め、高さは選択欄に合わせる。
+   枠と地色は残す（前に外したら、ただの記号に見えて押せると分からなかった） */
 #model_row button {
     min-width: 0;
     width: 2.3rem;
     flex: 0 0 2.3rem;
-    /* 高さを決め打ちせず、入力欄と同じ「縦 padding + 1 行」で組み立てる。
-       同じ計算で高さが出るので、テーマが変わってもずれない */
-    padding: var(--input-padding, 8px 10px);
-    padding-left: 0;
-    padding-right: 0;
-    border: 1px solid var(--button-secondary-border-color, var(--border-color-primary, #d4d4d8));
-    border-radius: var(--radius-sm, 6px);
-    background: var(--button-secondary-background-fill, #f4f4f5);
-    box-shadow: var(--shadow-drop, 0 1px 2px rgb(0 0 0 / 8%));
-    color: var(--body-text-color, #27272a);
+    height: __BTN_H__;
+    padding: 0;
+    border: var(--input-border-width, 1px) solid var(--border-color-primary, #4b4b55);
+    border-radius: var(--input-radius, 6px);
+    background: var(--button-secondary-background-fill, #3f3f46);
+    box-shadow: var(--input-shadow, none);
+    color: var(--body-text-color, #e4e4e7);
     font-size: 1.05rem;
-    line-height: var(--line-sm, 1.25);
+    line-height: 1;
     cursor: pointer;
 }
 #model_row button:hover {
-    background: var(--button-secondary-background-fill-hover, #e4e4e7);
-    border-color: var(--body-text-color-subdued, #a1a1aa);
+    background: var(--button-secondary-background-fill-hover, #52525b);
 }
 /* 押した瞬間に沈める。反応があったことを触感として返す */
 #model_row button:active {
@@ -243,6 +226,7 @@ gradio-app {
 def build_css() -> str:
     return (
         CSS.replace("__ZOOM__", str(UI_ZOOM))
+        .replace("__BTN_H__", REFRESH_BTN_HEIGHT)
         .replace("__STAR_OFF__", _star("none", "%23a1a1aa"))
         .replace("__STAR_ON__", _star("%23fbbf24", "%23f59e0b"))
     )

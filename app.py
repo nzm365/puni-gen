@@ -705,8 +705,8 @@ with gr.Blocks(title="PuniGen") as demo:
             # 左に操作系、右に生成結果。縦に伸ばさず 1 画面に収める
             with gr.Row(equal_height=False):
                 with gr.Column(scale=1):
-                    # 枠は行そのものに描き、中の 2 つは枠を持たない（CSS 側で指定）。
-                    # 見た目としては、モデル選択の枠の中に再読み込みボタンが入る
+                    # 選択欄自身の枠は残し、ボタンをその右へ密着させて
+                    # 1 つの入力グループに見せる（CSS 側で指定）
                     with gr.Row(elem_id="model_row"):
                         model_dd = gr.Dropdown(
                             ckpts, value=ckpts[0] if ckpts else None, label="モデル", scale=4
