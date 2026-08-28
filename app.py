@@ -617,20 +617,35 @@ def fav_button_state(which, last, picked, hist_sel):
     return _fav_button(last, picked)
 
 
-def on_variations_target(which, last, picked, hist_sel):
+def begin_job(which, last, picked, hist_sel):
+    """押された時点で対象を確定し、先に「今回の結果」へ切り替える。
+
+    切り替えはチェーンの最後にあったため、履歴から押すと生成が終わるまで
+    履歴を見たままだった。進捗バーも途中プレビューも右カラムに出るので、
+    待っている間こそそちらを見せたい。だから押した直後に移す。
+
+    対象をここで確定して State に持たせるのは、切り替えに伴って which_out が
+    current になっても、履歴で選んだ画像を見失わないようにするため。
+    """
     state, idx, msg = _target(which, last, picked, hist_sel)
-    if msg:
-        yield gr.update(), _note(msg), gr.skip(), gr.skip()
-        return
-    yield from on_variations(state, idx)
+    job = {"state": state, "idx": idx, "msg": msg}
+    if msg:  # 実行できないので、タブも操作対象も動かさない
+        return job, gr.skip(), gr.skip()
+    return job, gr.Tabs(selected="current"), "current"
 
 
-def on_upscale_target(which, last, picked, hist_sel):
-    state, idx, msg = _target(which, last, picked, hist_sel)
-    if msg:
-        yield gr.update(), _note(msg), gr.skip(), gr.skip()
+def run_variations(job):
+    if job["msg"]:
+        yield gr.update(), _note(job["msg"]), gr.skip(), gr.skip()
         return
-    yield from on_upscale(state, idx)
+    yield from on_variations(job["state"], job["idx"])
+
+
+def run_upscale(job):
+    if job["msg"]:
+        yield gr.update(), _note(job["msg"]), gr.skip(), gr.skip()
+        return
+    yield from on_upscale(job["state"], job["idx"])
 
 
 def on_favorite_target(which, last, picked, hist_sel):
@@ -774,6 +789,9 @@ with gr.Blocks(title="PuniGen") as demo:
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
                     last_gen = gr.State(None)
+                    # 押された時点の操作対象。タブを先に切り替えても見失わないよう、
+                    # begin_job がここに確定した対象を入れて次の処理へ渡す
+                    job = gr.State(None)
                     picked = gr.State(None)
                     # 履歴側で選ばれている画像の条件と、いま開いているサブタブ
                     hist_sel = gr.State(None)
@@ -884,27 +902,26 @@ with gr.Blocks(title="PuniGen") as demo:
     hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
 
     # --- 操作ボタン（1 組で両方のサブタブを兼ねる）---
-    # 再生成したら「今回の結果」へ切り替え、履歴一覧も更新する。
-    # 結果の表示場所を 1 か所に保ちつつ、履歴に新しい画像を反映させるため。
-    def _to_current():
-        return gr.Tabs(selected="current"), "current"
-
     _refresh_hist = (on_refresh_history, None,
                      [hist_gallery, hist_sel, info])
 
+    # 先に対象を確定してタブを切り替え、そのあとで生成に入る。
+    # 履歴に新しい画像を反映させるため、終わったら一覧も更新する
     variation.click(
-        on_variations_target, [which_out, last_gen, picked, hist_sel],
-        [gallery, progress, info, last_gen],
-    ).then(_to_current, None, [out_tabs, which_out]).then(
-        lambda: None, None, picked
-    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+        begin_job, [which_out, last_gen, picked, hist_sel], [job, out_tabs, which_out],
+    ).then(
+        run_variations, job, [gallery, progress, info, last_gen],
+    ).then(lambda: None, None, picked).then(
+        fav_button_state, *_fav_args
+    ).then(*_refresh_hist)
 
     hires.click(
-        on_upscale_target, [which_out, last_gen, picked, hist_sel],
-        [gallery, progress, info, last_gen],
-    ).then(_to_current, None, [out_tabs, which_out]).then(
-        lambda: None, None, picked
-    ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
+        begin_job, [which_out, last_gen, picked, hist_sel], [job, out_tabs, which_out],
+    ).then(
+        run_upscale, job, [gallery, progress, info, last_gen],
+    ).then(lambda: None, None, picked).then(
+        fav_button_state, *_fav_args
+    ).then(*_refresh_hist)
 
     # お気に入りは画像が増えないのでサブタブは切り替えない。
     # 履歴一覧も貼り替えない。押した画像は outputs から favorites へ移るため、

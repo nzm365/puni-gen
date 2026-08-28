@@ -206,9 +206,12 @@ gradio-app {
    未登録は輪郭だけのグレー、登録済みは塗りつぶしの黄色。 */
 .gradio-container button.fav-btn {
     background-image: url("data:image/svg+xml,__STAR_OFF__");
-    background-repeat: no-repeat;
-    background-position: center;
-    background-size: 20px 20px;
+    /* 登録済みのときは variant="primary" が付く。Gradio の .primary は background を
+       一括指定で当てるので、repeat / position / size が初期値に戻され、星が
+       ボタン一面に敷き詰められる（実際にそうなっていた）。ここは譲らない */
+    background-repeat: no-repeat !important;
+    background-position: center !important;
+    background-size: 20px 20px !important;
     min-width: 46px;
     /* ラベルが空だと、display:flex のボタンは中身が無いぶん高さ 14px まで潰れる
        （文字ありのボタンは 36px）。line-height も min-height も期待どおり効かないので、
@@ -227,10 +230,10 @@ gradio-app {
 
 /* 押せることが分かるよう、触れたときだけ少しだけ大きくする */
 .gradio-container button.fav-btn:hover {
-    background-size: 22px 22px;
+    background-size: 22px 22px !important;
 }
 @media (prefers-reduced-motion: reduce) {
-    .gradio-container button.fav-btn:hover { background-size: 20px 20px; }
+    .gradio-container button.fav-btn:hover { background-size: 20px 20px !important; }
 }
 """
 
