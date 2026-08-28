@@ -62,6 +62,14 @@ gradio-app {
 #progress_line {
     min-height: 0;
 }
+
+/* Gradio はジェネレータの実行中、出力コンポーネントの枠を 2 秒周期で点滅させる
+   (statustracker の .generating)。この行はバー自体が動いているので枠は情報を足さず、
+   二重に主張してうるさいだけなので止める */
+#progress_line .generating {
+    border: none !important;
+    animation: none !important;
+}
 #progress_line .pg {
     margin: 0 0 6px;
 }

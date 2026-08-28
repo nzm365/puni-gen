@@ -66,15 +66,22 @@ def load_or_alert(ckpt, on_phase=None) -> str:
         raise gr.Error(str(e)) from e
 
 
-def on_model_change(ckpt):
-    """モデル選択 → ロード＋プリセット適用
+def on_model_load(ckpt):
+    """モデルを読み込み、進捗バーだけを更新する。
 
     ロードは 6GB 級のファイル読み込みで数十秒かかる。以前はここが同期呼び出しで、
     終わるまで画面に何も出ず「固まった」と見えていた。ワーカーに逃がして、
-    engine から届く段階表示をそのまま status に流す。
+    engine から届く段階表示を progress に流す。
+
+    出力を progress と State の 2 つに絞っているのは、Gradio がジェネレータの
+    実行中「出力として宣言した全コンポーネント」の枠を点滅させるため
+    (statustracker の .generating: 2px の枠 + 2 秒周期の明滅)。
+    プリセット欄まで出力に含めると、ロードしている数十秒のあいだ
+    プレフィックスや Steps といった無関係な入力欄まで点滅してしまう。
+    確定後の反映は .success で繋ぐ apply_preset（通常の関数）に任せる。
     """
     if not ckpt:
-        yield (gr.update(),) * 8
+        yield "", gr.skip()
         return
 
     q: queue.Queue = queue.Queue()
@@ -89,21 +96,28 @@ def on_model_change(ckpt):
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    # ロード中は status もプリセット欄も触らない。動いている印は progress だけに出す
-    _hold = (gr.skip(),) * 7
-    yield (_bar("モデルを準備しています..."), *_hold)
+    yield _bar("モデルを準備しています..."), gr.skip()
     while (text := q.get()) is not None:
-        yield (_bar(text), *_hold)
+        yield _bar(text), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
+    # 待ちが終わったので進捗行を消し、確定した状態は State に預けて次へ渡す
+    yield "", res["msg"]
 
+
+def apply_preset(ckpt, load_msg):
+    """ロード完了後にモデルの状態とプリセットを入れる。
+
+    通常の関数なので、Gradio はこれらの欄を「生成中」として扱わない（枠が点滅しない）。
+    """
+    if not ckpt:
+        return (gr.skip(),) * 7
     p = load_preset(ckpt)
     # ユーザーがプロンプトを打っている間に、裏で 1 step 回して初回のもたつきを消す
     threading.Thread(target=engine.warmup, args=tuple(p["size"]), daemon=True).start()
-    yield (
-        "",            # 待ちが終わったので進捗行は消す
-        res["msg"],    # 確定したモデルの状態は左に残す
+    return (
+        load_msg,
         p["prefix_pos"],
         p["default_neg"],
         p["steps"],
@@ -758,6 +772,9 @@ with gr.Blocks(title="PuniGen") as demo:
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
                     last_gen = gr.State(None)
+                    # ロードの結果メッセージを apply_preset へ渡すだけの入れ物。
+                    # State は画面に出ないので、点滅の対象にもならない
+                    load_msg = gr.State("")
                     picked = gr.State(None)
                     # 履歴側で選ばれている画像の条件と、いま開いているサブタブ
                     hist_sel = gr.State(None)
@@ -813,8 +830,12 @@ with gr.Blocks(title="PuniGen") as demo:
     # お気に入りボタンの表示更新は多くの操作の後に走るので、引数をまとめておく
     _fav_args = ([which_out, last_gen, picked, hist_sel], favorite)
 
-    preset_outputs = [progress, status, prefix, negative, steps, cfg, sampler, clip_skip]
-    model_dd.change(on_model_change, model_dd, preset_outputs)
+    preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
+    # ロード中の点滅を progress だけに閉じ込めるため、ロード（ジェネレータ）と
+    # 反映（通常の関数）を 2 段に分ける。失敗したらプリセットは入れないので .success
+    model_dd.change(on_model_load, model_dd, [progress, load_msg]).success(
+        apply_preset, [model_dd, load_msg], preset_outputs
+    )
     refresh.click(lambda: gr.update(choices=list_checkpoints()), None, model_dd)
 
     token_save.click(civitai.save_token, token_box, token_status)
@@ -901,7 +922,9 @@ with gr.Blocks(title="PuniGen") as demo:
     # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
     stop.click(engine.request_cancel, None, None)
     if ckpts:
-        demo.load(on_model_change, model_dd, preset_outputs)
+        demo.load(on_model_load, model_dd, [progress, load_msg]).success(
+            apply_preset, [model_dd, load_msg], preset_outputs
+        )
 
 demo.launch(
     inbrowser=True,
