@@ -203,6 +203,9 @@ class Engine:
         # ロードと生成の直列化。Gradio の demo.load はブラウザのタブごとに発火するため、
         # タブが複数あると同じモデルのロードが同時に走り、GPU に 2 個分載って溢れる。
         self._lock = threading.Lock()
+        # いま _lock を握っている処理の名前。待たされた側が「何を待っているのか」を
+        # 名指しできるようにするためだけに使う（ロックの正しさには関与しない）
+        self._busy: str | None = None
         self._offload = False
         # (モデル, プロンプト, ネガティブ, clip_skip) → encode_prompt の結果。
         # seed だけ変えて連打する使い方ではテキストエンコーダ 2 基を毎回回す必要がない
@@ -229,16 +232,27 @@ class Engine:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
 
+    def _wait_note(self, next_action: str) -> str:
+        """ロック待ちの文言。何を待っているのかと、終わったら何をするのかを両方出す。
+
+        ただ「他の処理」とだけ書くと、待たされている側からは何が起きているのか
+        分からない。特にウォームアップは画面に出ない裏の処理なので、
+        名前を出さないと理由の分からない待ちになる。
+        """
+        return f"{self._busy or '別の処理'}が終わるのを待っています... (終わり次第{next_action})"
+
     # ---------- モデル ----------
     def load(self, ckpt_name: str, on_phase=None) -> str:
         # ロックが空いていないときだけ待機中と伝える。生成中にモデルを切り替えると
         # ここで数十秒待つが、黙って止まって見えると固まったと誤解される
         if not self._lock.acquire(blocking=False):
-            _say(on_phase, "他の処理が終わるのを待っています...")
+            _say(on_phase, self._wait_note("モデルを読み込みます"))
             self._lock.acquire()
+        self._busy = "モデルの読み込み"
         try:
             return self._load_impl(ckpt_name, on_phase)
         finally:
+            self._busy = None
             self._lock.release()
 
     def _load_impl(self, ckpt_name: str, on_phase=None) -> str:
@@ -355,6 +369,8 @@ class Engine:
             return  # オフロード時は毎回の転送が支配的で、ウォームアップの意味が薄い
         if not self._lock.acquire(blocking=False):
             return  # 生成が始まっていたら邪魔をしない
+        # 画面に出ない裏の処理なので、待たされた側にはこの名前で見える
+        self._busy = "次の生成を速くする準備"
         try:
             with torch.inference_mode():
                 pe, ne, pp, pn = self._get_embeds("1girl", "", 2)
@@ -370,6 +386,7 @@ class Engine:
         except Exception as e:  # noqa: BLE001 — ウォームアップは失敗しても実害なし
             print(f"[warmup] skip: {e}")
         finally:
+            self._busy = None
             self._lock.release()
 
     # ---------- Embedding (SDXL 形式: clip_l / clip_g) ----------
@@ -767,11 +784,13 @@ class Engine:
     def generate(self, *args, on_phase=None, **kwargs):
         # 生成も直列化する。二重クリック等で 2 つ同時に走ると作業メモリが倍増して溢れる
         if not self._lock.acquire(blocking=False):
-            _say(on_phase, "他の処理が終わるのを待っています...")
+            _say(on_phase, self._wait_note("生成を始めます"))
             self._lock.acquire()
+        self._busy = "画像の生成"
         try:
             return self._generate_impl(*args, on_phase=on_phase, **kwargs)
         finally:
+            self._busy = None
             self._lock.release()
 
     @torch.inference_mode()
