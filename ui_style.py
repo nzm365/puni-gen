@@ -66,7 +66,11 @@ gradio-app {
     border: 1px solid var(--block-border-color, var(--border-color-primary, #d4d4d8));
     border-radius: var(--block-radius, 8px);
     background: var(--block-background-fill, transparent);
-    padding-right: var(--size-1, 4px);
+    /* 下の余白は行側に持たせる。align-items: flex-end なので選択欄とボタンは
+       この余白の上で下端がそろい、囲いの内側にも同じだけ空きができる */
+    padding: 0 var(--size-1, 4px) var(--block-padding, 8px) 0;
+    /* 囲いと次の入力欄の間にも間隔を空ける */
+    margin-bottom: var(--size-2, 8px);
     gap: 0;
     flex-wrap: nowrap;
     /* 中央ではなく下端に揃える。選択欄の上には「モデル」のラベルがあるので、
@@ -113,22 +117,6 @@ gradio-app {
 #model_row button:active {
     transform: translateY(1px);
     box-shadow: none;
-}
-
-/* ---- モデルの状態表示 ----
-   進捗バーのすぐ上に並ぶので、字面と左端を進捗行の文字 (.pg-text) に合わせる。
-   合わせないと、同じ場所に出る 2 行なのに大きさも位置も違って見える。 */
-#model_status {
-    min-height: 0;
-    padding: 0;
-}
-#model_status p {
-    margin: 0 0 4px;
-    font-size: 0.9em;
-    line-height: 1.5;
-    color: var(--body-text-color-subdued, #71717a);
-    /* モデル名が長いので、途中でも折り返して横に溢れさせない */
-    overflow-wrap: anywhere;
 }
 
 /* ---- 進捗バー ----
@@ -192,11 +180,6 @@ gradio-app {
 }
 #progress_line .pg-done .pg-text {
     color: var(--body-text-color, #27272a);
-}
-#progress_line .pg-done .pg-text::before {
-    content: "✓ ";
-    color: #22c55e;
-    font-weight: 700;
 }
 
 /* 一言だけのとき（中止しました、など）はバーを出さない */

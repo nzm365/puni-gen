@@ -83,7 +83,7 @@ def on_model_load(ckpt):
     終わるまで画面に何も出ず「固まった」と見えていた。ワーカーに逃がして、
     engine から届く段階表示を progress に流す。
 
-    出力を progress と State の 2 つに絞っているのは、Gradio がジェネレータの
+    出力を progress だけに絞っているのは、Gradio がジェネレータの
     実行中「出力として宣言した全コンポーネント」の枠を点滅させるため
     (statustracker の .generating: 2px の枠 + 2 秒周期の明滅)。
     プリセット欄まで出力に含めると、ロードしている数十秒のあいだ
@@ -91,7 +91,7 @@ def on_model_load(ckpt):
     確定後の反映は .success で繋ぐ apply_preset（通常の関数）に任せる。
     """
     if not ckpt:
-        yield "", gr.skip()
+        yield ""
         return
 
     q: queue.Queue = queue.Queue()
@@ -106,28 +106,28 @@ def on_model_load(ckpt):
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    yield _bar("モデルを準備しています..."), gr.skip()
+    yield _bar("モデルを準備しています...")
     while (text := q.get()) is not None:
-        yield _bar(text), gr.skip()
+        yield _bar(text)
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
-    # 待ちが終わったので進捗行を消し、確定した状態は State に預けて次へ渡す
-    yield _done("読み込み完了"), res["msg"]
+    # VRAM の判定結果は画面には出さない。切り分けに要るのでコンソールには残す
+    print(res["msg"])
+    yield _done("読み込み完了")
 
 
-def apply_preset(ckpt, load_msg):
-    """ロード完了後にモデルの状態とプリセットを入れる。
+def apply_preset(ckpt):
+    """ロード完了後にプリセットを入れる。
 
     通常の関数なので、Gradio はこれらの欄を「生成中」として扱わない（枠が点滅しない）。
     """
     if not ckpt:
-        return (gr.skip(),) * 7
+        return (gr.skip(),) * 6
     p = load_preset(ckpt)
     # ユーザーがプロンプトを打っている間に、裏で 1 step 回して初回のもたつきを消す
     threading.Thread(target=engine.warmup, args=tuple(p["size"]), daemon=True).start()
     return (
-        load_msg,
         p["prefix_pos"],
         p["default_neg"],
         p["steps"],
@@ -713,13 +713,9 @@ with gr.Blocks(title="PuniGen") as demo:
                         )
                         # min_width を切らないと、Gradio の既定でボタンが横に広がる
                         refresh = gr.Button("↻", scale=0, min_width=0)
-                    # 進捗行と同じ字面・同じ左端に揃える（CSS 側で指定）
-                    status = gr.Markdown("", elem_id="model_status")
-                    # 進行中のことだけを出す 1 行。status のすぐ下に置く。
-                    # 空にすると行ごと消えるので、待ちが無いときは場所を取らない。
+                    # 進行中のことと、終わったことだけを出す 1 行。
                     # 「いま何をしているか」の置き場はここ 1 箇所に限る。
-                    # モデルの確定状態は上の status、完成した絵の情報は右の info と
-                    # 役割を分け、同じ文言が 2 箇所に出ないようにしている
+                    # 完成した絵の情報は右の info が受け持つ
                     progress = gr.HTML("", elem_id="progress_line")
 
                     prefix = gr.Textbox(label="プレフィックス（プリセットから自動）", lines=1)
@@ -786,9 +782,6 @@ with gr.Blocks(title="PuniGen") as demo:
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
                     # 結果ギャラリーで選ばれている画像の番号
                     last_gen = gr.State(None)
-                    # ロードの結果メッセージを apply_preset へ渡すだけの入れ物。
-                    # State は画面に出ないので、点滅の対象にもならない
-                    load_msg = gr.State("")
                     picked = gr.State(None)
                     # 履歴側で選ばれている画像の条件と、いま開いているサブタブ
                     hist_sel = gr.State(None)
@@ -844,11 +837,11 @@ with gr.Blocks(title="PuniGen") as demo:
     # お気に入りボタンの表示更新は多くの操作の後に走るので、引数をまとめておく
     _fav_args = ([which_out, last_gen, picked, hist_sel], favorite)
 
-    preset_outputs = [status, prefix, negative, steps, cfg, sampler, clip_skip]
+    preset_outputs = [prefix, negative, steps, cfg, sampler, clip_skip]
     # ロード中の点滅を progress だけに閉じ込めるため、ロード（ジェネレータ）と
     # 反映（通常の関数）を 2 段に分ける。失敗したらプリセットは入れないので .success
-    model_dd.change(on_model_load, model_dd, [progress, load_msg]).success(
-        apply_preset, [model_dd, load_msg], preset_outputs
+    model_dd.change(on_model_load, model_dd, progress).success(
+        apply_preset, model_dd, preset_outputs
     )
     refresh.click(lambda: gr.update(choices=list_checkpoints()), None, model_dd)
 
@@ -936,8 +929,8 @@ with gr.Blocks(title="PuniGen") as demo:
     # 中止は別イベントとして並走し、次の step で生成ループを打ち切る
     stop.click(engine.request_cancel, None, None)
     if ckpts:
-        demo.load(on_model_load, model_dd, [progress, load_msg]).success(
-            apply_preset, [model_dd, load_msg], preset_outputs
+        demo.load(on_model_load, model_dd, progress).success(
+            apply_preset, model_dd, preset_outputs
         )
 
 demo.launch(
