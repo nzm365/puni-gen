@@ -6,7 +6,13 @@ setup.bat と start.bat を順に実行すれば動きます。
 
 **P**uni **U**ses **N**o **I**ntricacy.
 
+## スクリーンショット
+メイン画面
+
 ![PuniGen の画面](docs/screenshot0.png)
+モデル検索画面
+
+![PuniGen の画面](docs/screenshot1.png)
 
 ## 主な機能
 
