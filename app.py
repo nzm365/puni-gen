@@ -687,6 +687,12 @@ with gr.Blocks(title="PuniGen") as demo:
                         )
                         refresh = gr.Button("↻", scale=0)
                     status = gr.Markdown("")
+                    # 進行中のことだけを出す 1 行。status のすぐ下に置く。
+                    # 空にすると行ごと消えるので、待ちが無いときは場所を取らない。
+                    # 「いま何をしているか」の置き場はここ 1 箇所に限る。
+                    # モデルの確定状態は上の status、完成した絵の情報は右の info と
+                    # 役割を分け、同じ文言が 2 箇所に出ないようにしている
+                    progress = gr.HTML("", elem_id="progress_line")
 
                     prefix = gr.Textbox(label="プレフィックス（プリセットから自動）", lines=1)
                     prompt = gr.Textbox(
@@ -747,12 +753,6 @@ with gr.Blocks(title="PuniGen") as demo:
                             "", variant="secondary", scale=1,
                             elem_classes=FAV_CLASS,
                         )
-                    # 進行中のことだけを出す 1 行。生成情報のすぐ上に置く。
-                    # 空にすると行ごと消えるので、待ちが無いときは場所を取らない。
-                    # 「いま何をしているか」の置き場はここ 1 箇所に限る。
-                    # モデルの確定状態は左の status、完成した絵の情報は下の info と
-                    # 役割を分け、同じ文言が 2 箇所に出ないようにしている
-                    progress = gr.HTML("", elem_id="progress_line")
                     info = gr.Textbox(label="生成情報", interactive=False, lines=3)
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と
