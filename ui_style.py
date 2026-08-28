@@ -66,37 +66,41 @@ gradio-app {
 }
 
 /* ---- モデル選択 + 再読み込みボタン ----
-   Gradio の Dropdown は .container .wrap が枠を描く。これが「ドロップダウンだ」と
-   分かるための枠なので消さない。行に別の枠を足すと二重になるため、行は枠を持たず、
-   ボタンを選択欄の右へ密着させて 1 つの入力グループに見せる。 */
+   「プレフィックス」などの入力欄と同じ見た目にする。Gradio のあの枠は border ではなく
+   .block padded の地色 + 内側の余白なので、同じ変数を行に当てて同じ箱を作る。
+   中の Dropdown からは箱としての役割を外し、選択欄の枠 (.container .wrap) だけ残す。
+   こうすると、ラベル・選択欄・ボタンが 1 つの箱に収まり、他の入力欄と揃う。 */
 #model_row {
+    background: var(--block-background-fill);
+    border: var(--block-border-width, 0px) solid var(--block-border-color, transparent);
+    border-radius: var(--block-radius, 8px);
+    padding: var(--block-padding, 10px 12px);
     gap: var(--spacing-sm, 4px);
     flex-wrap: nowrap;
     /* ラベル「モデル」のぶん選択欄は下寄りにあるので、下端で揃える */
     align-items: flex-end;
     margin-bottom: var(--size-2, 8px);
 }
-/* 行の中の入れ物は余白と枠を持たない。枠は .wrap だけが持つ */
+/* 中の入れ物は箱の役割を持たない。地色も余白も外側の行が持つ */
 #model_row .block,
 #model_row .form {
-    border: none;
     background: transparent;
+    border: none;
     box-shadow: none;
-    /* 上だけ残す。ラベル「モデル」の上の余白はこれ。左右と下を 0 にすると
-       選択欄の枠が行の端まで届き、ボタンとの間隔が gap だけになる */
-    padding: var(--block-padding, 10px) 0 0 0;
+    padding: 0;
 }
 
 /* 再読み込みボタン。幅は文字 1 つぶんまで詰め、高さは選択欄に合わせる。
-   枠と地色は残す（前に外したら、ただの記号に見えて押せると分からなかった） */
+   高さは --checkbox-label-padding 依存でテーマ側でしか決まらず計算で出せないため、
+   ブラウザで実測して REFRESH_BTN_HEIGHT に置いている */
 #model_row button {
     min-width: 0;
     width: 2.3rem;
     flex: 0 0 2.3rem;
     height: __BTN_H__;
     padding: 0;
-    border: var(--input-border-width, 1px) solid var(--border-color-primary, #4b4b55);
-    border-radius: var(--input-radius, 6px);
+    border: var(--input-border-width, 1px) solid var(--border-color-primary, #3f3f46);
+    border-radius: var(--input-radius, 4px);
     background: var(--button-secondary-background-fill, #3f3f46);
     box-shadow: var(--input-shadow, none);
     color: var(--body-text-color, #e4e4e7);
