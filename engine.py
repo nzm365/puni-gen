@@ -124,6 +124,16 @@ class InsufficientVram(RuntimeError):
     """VRAM が足りないと分かったのでロードを中止した。"""
 
 
+def _say(on_phase, text: str) -> None:
+    """いま何を待っているかを画面へ伝える。
+
+    print はコンソール向けの詳細として残し、こちらには初心者が読んで
+    「止まっていない」と分かる粒度の文だけを流す。コールバックが無ければ何もしない。
+    """
+    if on_phase is not None:
+        on_phase(text)
+
+
 def fp16_footprint(path: Path) -> tuple[float, float] | None:
     """safetensors のヘッダだけ読み、fp16 換算の (全体, UNet) を GB で返す。
 
@@ -220,20 +230,33 @@ class Engine:
                 torch.backends.cudnn.allow_tf32 = True
 
     # ---------- モデル ----------
-    def load(self, ckpt_name: str) -> str:
-        with self._lock:
-            return self._load_impl(ckpt_name)
+    def load(self, ckpt_name: str, on_phase=None) -> str:
+        # ロックが空いていないときだけ待機中と伝える。生成中にモデルを切り替えると
+        # ここで数十秒待つが、黙って止まって見えると固まったと誤解される
+        if not self._lock.acquire(blocking=False):
+            _say(on_phase, "他の処理が終わるのを待っています...")
+            self._lock.acquire()
+        try:
+            return self._load_impl(ckpt_name, on_phase)
+        finally:
+            self._lock.release()
 
-    def _load_impl(self, ckpt_name: str) -> str:
+    def _load_impl(self, ckpt_name: str, on_phase=None) -> str:
         if self.current == ckpt_name and self.pipe is not None:
             return f"already loaded: {ckpt_name}"
+        _say(on_phase, f"モデルを準備しています: {ckpt_name}")
         self.unload()
         path = CKPT_DIR / ckpt_name
+        _say(on_phase, "空き VRAM を確認しています...")
         offload, mode = self._plan(path)  # 載らないと分かればここで例外
+        # ここが全体で最も長い。6GB 級のファイルを読むので数十秒かかる
+        gb = path.stat().st_size / 1024**3
+        _say(on_phase, f"重みを読み込んでいます... ({gb:.1f}GB / 初回は 1 分ほどかかります)")
         pipe = StableDiffusionXLPipeline.from_single_file(
             str(path), torch_dtype=torch.float16, use_safetensors=True
         )
         self.pipe = pipe
+        _say(on_phase, "embedding を読み込んでいます...")
         self._load_embeddings()  # オフロードのフックが付く前に済ませる
         if USE_FUSE_QKV:
             pipe.fuse_qkv_projections()  # attention の Q/K/V を 1 つの行列積に融合 (+1.2GB)
@@ -244,9 +267,11 @@ class Engine:
         # VRAM から溢れて生成が数十倍遅くなる（実測済み）。
         self.pipe_i2i = StableDiffusionXLImg2ImgPipeline.from_pipe(pipe, torch_dtype=torch.float16)
         if offload:
+            _say(on_phase, "CPU オフロードを準備しています... (VRAM が少ないため低速モード)")
             pipe.enable_model_cpu_offload()
             pipe.vae.enable_tiling()  # 8GB 級では VAE デコードのピークも惜しい
         else:
+            _say(on_phase, "GPU へ転送しています...")
             pipe.to("cuda")
             if USE_CHANNELS_LAST:
                 # Tensor Core が効きやすいメモリ配置（オフロード時は転送が支配的なので省略）
@@ -488,7 +513,7 @@ class Engine:
         print(f"[vae] {'タイル分割' if tile else '一括'}デコード "
               f"(必要 ~{need / 1024**3:.1f}GB / 利用可 {avail / 1024**3:.1f}GB{note})")
 
-    def _decode_latents(self, latents: torch.Tensor) -> list[Image.Image]:
+    def _decode_latents(self, latents: torch.Tensor, on_phase=None) -> list[Image.Image]:
         """latent を 1 枚ずつ画像へ。fp16 一括デコードを基本に、二段の安全網を持つ。
 
         - fp16 の結果に NaN/Inf → そのモデルを bf16 デコードに切り替えて撮り直し。
@@ -512,7 +537,7 @@ class Engine:
         self._plan_tiling(lat)
         pils: list[Image.Image] = []
         with self._no_cudnn_benchmark():
-            pils = self._decode_loop(lat, pils)
+            pils = self._decode_loop(lat, pils, on_phase)
         # デコードで一時的に膨らんだ予約が物理 VRAM を超えたままだと、次の生成が
         # 共有メモリ退避の影響を引きずって数割遅くなる。超過時のみ返却する
         props = torch.cuda.get_device_properties(0)
@@ -520,7 +545,7 @@ class Engine:
             torch.cuda.empty_cache()
         return pils
 
-    def _decode_loop(self, lat, pils) -> list[Image.Image]:
+    def _decode_loop(self, lat, pils, on_phase=None) -> list[Image.Image]:
         pipe = self.pipe
         vae = pipe.vae
         i = 0
@@ -546,18 +571,21 @@ class Engine:
                         vae.to(alt)
                         name = "bf16" if alt == torch.bfloat16 else "fp32"
                         print(f"[vae] {self.current}: fp16 デコードが NaN/Inf を出したため {name} に切替")
+                        _say(on_phase, f"このモデルは {name} が必要でした。変換をやり直しています...")
                     else:
                         # bf16 でも NaN (理論上ほぼ起きない)。最後の砦の fp32 + タイル分割へ
                         vae.to(torch.float32)
                         vae.enable_tiling()
                         self._vae_force_tiling = True
                         print(f"[vae] {self.current}: bf16 でも NaN/Inf のため fp32 (タイル分割) に切替")
+                        _say(on_phase, "変換をやり直しています... (安全な設定に切り替え)")
 
                     continue
             except torch.cuda.OutOfMemoryError:
                 if getattr(vae, "use_tiling", False):
                     raise  # タイル分割でも溢れた。これ以上は退避先がない
                 print("[vae] 一括デコードが VRAM に載らないためタイル分割に切替")
+                _say(on_phase, "VRAM が足りないため分割して変換しています...")
                 torch.cuda.empty_cache()
                 vae.enable_tiling()
                 self._vae_force_tiling = True  # 見積りが外れた。以後は毎回の判定より優先
@@ -715,13 +743,13 @@ class Engine:
     def variations(self, prompt: str, negative: str, width: int, height: int, steps: int,
                    cfg: float, sampler: str, clip_skip: int, seed: int,
                    count: int = VARIATION_COUNT, strength: float = VARIATION_STRENGTH,
-                   preview_cb=None):
+                   preview_cb=None, on_phase=None):
         """気に入った絵の seed を固定したまま、少しだけ違う絵を count 枚出す。"""
         assert self.pipe is not None, "model not loaded"
         lat = self.variation_latents(seed, width, height, count, strength)
         return self.generate(
             prompt, negative, width, height, steps, cfg, sampler, clip_skip, seed, count,
-            preview_cb=preview_cb, init_latents=lat,
+            preview_cb=preview_cb, init_latents=lat, on_phase=on_phase,
         )
 
     # ---------- 生成 ----------
@@ -736,10 +764,15 @@ class Engine:
         """UI の中止ボタン。次の step で生成を打ち切る（途中の絵は保存されない）。"""
         self.cancel.set()
 
-    def generate(self, *args, **kwargs):
+    def generate(self, *args, on_phase=None, **kwargs):
         # 生成も直列化する。二重クリック等で 2 つ同時に走ると作業メモリが倍増して溢れる
-        with self._lock:
-            return self._generate_impl(*args, **kwargs)
+        if not self._lock.acquire(blocking=False):
+            _say(on_phase, "他の処理が終わるのを待っています...")
+            self._lock.acquire()
+        try:
+            return self._generate_impl(*args, on_phase=on_phase, **kwargs)
+        finally:
+            self._lock.release()
 
     @torch.inference_mode()
     def _generate_impl(
@@ -758,6 +791,7 @@ class Engine:
         strength: float = 0.6,
         preview_cb=None,
         init_latents=None,
+        on_phase=None,
     ):
         """返り値: (images | None, seed, 計測行)。中止されたときは images が None。"""
         assert self.pipe is not None, "model not loaded"
@@ -835,6 +869,7 @@ class Engine:
         if self.cancel.is_set():
             return None, seed, self._perf_line(phases, 0)  # 中断: デコード代も払わない
 
+        _say(on_phase, "画像に変換しています...")
         with self._phase(phases, "vae"):
-            images = self._decode_latents(latents)
+            images = self._decode_latents(latents, on_phase)
         return images, seed, self._perf_line(phases, total)

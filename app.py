@@ -36,24 +36,50 @@ ASPECTS = {
 }
 
 
-def load_or_alert(ckpt) -> str:
+def load_or_alert(ckpt, on_phase=None) -> str:
     """VRAM 不足はトレースバックではなく画面のエラー表示にする。"""
     try:
-        return engine.load(ckpt)
+        return engine.load(ckpt, on_phase=on_phase)
     except InsufficientVram as e:
         raise gr.Error(str(e)) from e
 
 
 def on_model_change(ckpt):
-    """モデル選択 → ロード＋プリセット適用"""
+    """モデル選択 → ロード＋プリセット適用
+
+    ロードは 6GB 級のファイル読み込みで数十秒かかる。以前はここが同期呼び出しで、
+    終わるまで画面に何も出ず「固まった」と見えていた。ワーカーに逃がして、
+    engine から届く段階表示をそのまま status に流す。
+    """
     if not ckpt:
-        return [gr.update()] * 7
-    msg = load_or_alert(ckpt)
+        yield (gr.update(),) * 7
+        return
+
+    q: queue.Queue = queue.Queue()
+    res = {}
+
+    def worker():
+        try:
+            res["msg"] = load_or_alert(ckpt, on_phase=q.put)
+        except Exception as e:  # noqa: BLE001
+            res["err"] = e
+        finally:
+            q.put(None)
+
+    threading.Thread(target=worker, daemon=True).start()
+    _hold = (gr.skip(),) * 6  # ロード中はプリセット欄に触らない
+    yield ("モデルを準備しています...", *_hold)
+    while (text := q.get()) is not None:
+        yield (text, *_hold)
+    if "err" in res:
+        e = res["err"]
+        raise e if isinstance(e, gr.Error) else gr.Error(str(e))
+
     p = load_preset(ckpt)
     # ユーザーがプロンプトを打っている間に、裏で 1 step 回して初回のもたつきを消す
     threading.Thread(target=engine.warmup, args=tuple(p["size"]), daemon=True).start()
-    return (
-        msg,
+    yield (
+        res["msg"],
         p["prefix_pos"],
         p["default_neg"],
         p["steps"],
@@ -128,8 +154,6 @@ def _save_async(images, paths, params: dict | None = None):
 
 def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
                 in_image, strength):
-    if engine.current != ckpt:
-        load_or_alert(ckpt)
     size = ASPECTS[aspect] or tuple(load_preset(ckpt)["size"])
     if in_image is not None:
         # i2i では入力のアスペクト比を保ち、選択サイズは画素数の目安として使う
@@ -153,11 +177,16 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
 
     def worker():
         try:
+            # モデルのロードもここで行う。呼び出し側でやると最初の yield まで
+            # 到達せず、その数十秒のあいだ画面が完全に無反応になる
+            if engine.current != ckpt:
+                load_or_alert(ckpt, on_phase=lambda t: q.put(("phase", t)))
             res["out"] = engine.generate(
                 full_prompt, negative, size[0], size[1],
                 steps, float(cfg), sampler, int(clip_skip), seed, n,
                 image=in_image, strength=float(strength),
-                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
+                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
             res["err"] = e
@@ -167,9 +196,12 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
     threading.Thread(target=worker, daemon=True).start()
     # 前回の結果を残したままだと「生成中」の表示と一緒に前の絵が見え、
     # それが今まさに生成中の絵だと誤解される。開始時点で必ず空にする
-    yield gr.update(value=[], selected_index=None), "生成中... 0 step", gr.skip()
+    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip()
     while (msg := q.get()) is not None:
-        s, total, imgs = msg
+        if msg[0] == "phase":
+            yield gr.update(), msg[1], gr.skip()
+            continue
+        _, s, total, imgs = msg
         if imgs is not None:
             yield imgs, f"生成中... {s}/{total} step（途中プレビュー）", gr.skip()
         else:
@@ -235,21 +267,24 @@ def on_upscale(last, idx):
     seeds = last.get("seeds") or []
     seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
-    yield gr.update(value=[], selected_index=None), "拡大しています...", gr.skip()
+    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip()
 
     q: queue.Queue = queue.Queue()
     res = {}
 
     def worker():
         try:
-            res["out"] = upscaler.upscale(src, upscaler.SCALE)
+            # 初回だけ 17MB のダウンロードとモデル読み込みが入る。
+            # そこも「拡大しています」の一言で覆うと、無反応の時間として見える
+            res["out"] = upscaler.upscale(src, upscaler.SCALE, on_phase=q.put)
         except Exception as e:  # noqa: BLE001
             res["err"] = e
         finally:
             q.put(None)
 
     threading.Thread(target=worker, daemon=True).start()
-    q.get()
+    while (text := q.get()) is not None:
+        yield gr.update(), text, gr.skip()
 
     if "err" in res:
         e = res["err"]
@@ -371,18 +406,18 @@ def on_variations(last, idx):
     base_seed = last["seeds"][i]
     w, h = last["size"]
 
-    if engine.current != last["ckpt"]:
-        load_or_alert(last["ckpt"])
-
     q: queue.Queue = queue.Queue()
     res = {}
 
     def worker():
         try:
+            if engine.current != last["ckpt"]:
+                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)))
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
-                preview_cb=lambda s, total, imgs: q.put((s, total, imgs)),
+                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
             res["err"] = e
@@ -391,9 +426,12 @@ def on_variations(last, idx):
 
     threading.Thread(target=worker, daemon=True).start()
     # 選択も解除する（前の絵を選んだままだと新しい結果と対応がずれる）
-    yield gr.update(value=[], selected_index=None), "変分を生成中... 0 step", gr.skip()
+    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip()
     while (msg := q.get()) is not None:
-        s, total, imgs = msg
+        if msg[0] == "phase":
+            yield gr.update(), msg[1], gr.skip()
+            continue
+        _, s, total, imgs = msg
         if imgs is not None:
             yield imgs, f"変分を生成中... {s}/{total} step（途中プレビュー）", gr.skip()
         else:
