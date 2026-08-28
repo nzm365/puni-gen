@@ -713,7 +713,8 @@ with gr.Blocks(title="PuniGen") as demo:
                         )
                         # min_width を切らないと、Gradio の既定でボタンが横に広がる
                         refresh = gr.Button("↻", scale=0, min_width=0)
-                    status = gr.Markdown("")
+                    # 進捗行と同じ字面・同じ左端に揃える（CSS 側で指定）
+                    status = gr.Markdown("", elem_id="model_status")
                     # 進行中のことだけを出す 1 行。status のすぐ下に置く。
                     # 空にすると行ごと消えるので、待ちが無いときは場所を取らない。
                     # 「いま何をしているか」の置き場はここ 1 箇所に限る。

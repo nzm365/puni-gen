@@ -69,7 +69,9 @@ gradio-app {
     padding-right: var(--size-1, 4px);
     gap: 0;
     flex-wrap: nowrap;
-    align-items: center;
+    /* 中央ではなく下端に揃える。選択欄の上には「モデル」のラベルがあるので、
+       中央だとボタンだけがラベルのぶん浮いて見える */
+    align-items: flex-end;
 }
 /* 中の 2 つは自前の枠・背景・影を持たない */
 #model_row .block,
@@ -79,21 +81,28 @@ gradio-app {
     background: transparent;
     box-shadow: none;
 }
+/* 選択欄の下端を行の下端に一致させる。これでボタンと高さが揃う */
+#model_row .block {
+    padding-bottom: 0;
+}
 /* 再読み込みボタン。幅は文字 1 つぶんまで詰めるが、枠と地色は残す。
    枠なしにすると、ただの記号に見えて押せることが伝わらなかった */
 #model_row button {
     min-width: 0;
     width: 2.3rem;
-    height: 2.1rem;
     flex: 0 0 2.3rem;
-    padding: 0;
+    /* 高さを決め打ちせず、入力欄と同じ「縦 padding + 1 行」で組み立てる。
+       同じ計算で高さが出るので、テーマが変わってもずれない */
+    padding: var(--input-padding, 8px 10px);
+    padding-left: 0;
+    padding-right: 0;
     border: 1px solid var(--button-secondary-border-color, var(--border-color-primary, #d4d4d8));
     border-radius: var(--radius-sm, 6px);
     background: var(--button-secondary-background-fill, #f4f4f5);
     box-shadow: var(--shadow-drop, 0 1px 2px rgb(0 0 0 / 8%));
     color: var(--body-text-color, #27272a);
     font-size: 1.05rem;
-    line-height: 1;
+    line-height: var(--line-sm, 1.25);
     cursor: pointer;
 }
 #model_row button:hover {
@@ -106,12 +115,30 @@ gradio-app {
     box-shadow: none;
 }
 
+/* ---- モデルの状態表示 ----
+   進捗バーのすぐ上に並ぶので、字面と左端を進捗行の文字 (.pg-text) に合わせる。
+   合わせないと、同じ場所に出る 2 行なのに大きさも位置も違って見える。 */
+#model_status {
+    min-height: 0;
+    padding: 0;
+}
+#model_status p {
+    margin: 0 0 4px;
+    font-size: 0.9em;
+    line-height: 1.5;
+    color: var(--body-text-color-subdued, #71717a);
+    /* モデル名が長いので、途中でも折り返して横に溢れさせない */
+    overflow-wrap: anywhere;
+}
+
 /* ---- 進捗バー ----
    app.py の progress（左カラム・モデルの状態表示の直下）専用。
    「いま何をしているか」はここだけに出る。
    空文字を入れると中身ごと消えるので、待ちが無いときは行が畳まれる。 */
 #progress_line {
     min-height: 0;
+    /* status と左端をそろえる */
+    padding: 0;
 }
 
 /* Gradio はジェネレータの実行中、出力コンポーネントの枠を 2 秒周期で点滅させる
