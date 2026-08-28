@@ -532,17 +532,6 @@ def on_refresh_history():
     return gr.update(value=files), None, gr.skip()
 
 
-def on_refresh_history_keep():
-    """一覧だけ更新し、選択中の画像は保つ。
-
-    お気に入りの追加・解除の直後に使う。通常の更新は選択を解除するが、
-    それだと解除した直後にもう一度押せず、「履歴から画像を選んでください」と
-    出てしまう（実際にそうなっていた）。
-    """
-    files = list_history()
-    return gr.update(value=files)
-
-
 def on_pick_history(evt: gr.SelectData):
     """履歴の画像を選ぶ。埋め込まれた生成条件を読み、そのまま再操作できる形にする。
 
@@ -754,12 +743,12 @@ with gr.Blocks(title="PuniGen") as demo:
                     # 今回の生成結果と過去の履歴を、同じ場所でサブタブとして切り替える。
                     # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
                     with gr.Tabs() as out_tabs:
-                        with gr.Tab("今回の結果", id="current") as cur_tab:
+                        with gr.Tab("今回の結果", id="current"):
                             # ラベルは出さない。タブ見出し「今回の結果」と同じことになる
                             gallery = gr.Gallery(
                                 show_label=False, columns=2, height=680, object_fit="contain",
                             )
-                        with gr.Tab("履歴", id="history") as hist_tab:
+                        with gr.Tab("履歴", id="history"):
                             # ラベルは出さない。タブ見出し「履歴」と同じことになる
                             hist_gallery = gr.Gallery(
                                 show_label=False, columns=3, height=620,
@@ -874,13 +863,18 @@ with gr.Blocks(title="PuniGen") as demo:
     # どちらのサブタブを開いているかを覚える。
     # Tabs の select が返す evt.value はラベル文字列なので、id と取り違えないよう
     # タブごとに定数を返す形にしている。
-    cur_tab.select(lambda: "current", None, which_out).then(
-        fav_button_state, [which_out, last_gen, picked, hist_sel], favorite
-    )
+    # 以前は gr.Tab ごとの select で受けていたが、「今回の結果」側は戻ってきても
+    # 発火しない。そのため履歴を一度開くと操作対象が history のまま戻らず、
+    # 今回の結果でお気に入りを押しても「履歴から画像を選んでください」になっていた
+    # （ブラウザで実測して確認）。Tabs 側の select は切り替えのたびに必ず発火する。
+    # evt.value はラベル文字列なので、順番の変わらない evt.index で判定する。
+    def _on_out_tab(evt: gr.SelectData):
+        if evt.index == 1:  # 履歴
+            return (*on_refresh_history(), "history")
+        return gr.skip(), gr.skip(), gr.skip(), "current"
 
-    hist_tab.select(
-        lambda: (*on_refresh_history(), "history"), None,
-        [hist_gallery, hist_sel, info, which_out],
+    out_tabs.select(
+        _on_out_tab, None, [hist_gallery, hist_sel, info, which_out],
     ).then(fav_button_state, *_fav_args)
     hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
         fav_button_state, *_fav_args
@@ -910,15 +904,15 @@ with gr.Blocks(title="PuniGen") as demo:
         lambda: None, None, picked
     ).then(fav_button_state, *_fav_args).then(*_refresh_hist)
 
-    # お気に入りは画像が増えないのでサブタブは切り替えない
-    # 追加・解除で outputs と favorites の間を移動するので一覧は更新するが、
-    # 選択は保つ（続けて押し直せるようにするため）
+    # お気に入りは画像が増えないのでサブタブは切り替えない。
+    # 履歴一覧も貼り替えない。押した画像は outputs から favorites へ移るため、
+    # 貼り替えると以降が 1 つずつ繰り上がり、選択中の番号が別の画像を指してしまう。
+    # 実際、表示だけが別の絵に変わり、生成情報とちぐはぐになっていた。
+    # 履歴はサブタブを開き直したときに更新されるので、ここでは触らない。
     favorite.click(
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
-    ).then(fav_button_state, *_fav_args).then(
-        on_refresh_history_keep, None, hist_gallery
-    )
+    ).then(fav_button_state, *_fav_args)
 
     fav_tab.select(on_refresh_favorites, None, fav_gallery)
     demo.load(on_refresh_favorites, None, fav_gallery)
