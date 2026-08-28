@@ -1,4 +1,5 @@
 """最小構成の Gradio UI。モデルを切り替えるとプリセット（推奨設定）が自動で入る。"""
+import html
 import json
 import queue
 import shutil
@@ -25,6 +26,27 @@ OUT_DIR = Path(__file__).parent / "outputs"
 FAV_DIR = Path(__file__).parent / "favorites"
 EMB_DIR = Path(__file__).parent / "models" / "embeddings"
 engine = Engine()
+
+# ---------- 進捗表示 ----------
+# ギャラリー下の 1 行に出す HTML を組み立てる。「いま何をしているか」はここだけに出す。
+# 待ちには 2 種類あり、見た目を分けている:
+#   - step 数のように残りが数えられるもの  -> 実際の割合まで伸びるバー
+#   - モデルの読み込みのように数えられないもの -> 縞が流れ続けるバー（止まっていない印）
+def _bar(text: str, frac: float | None = None) -> str:
+    """進捗バー。frac が None なら割合不明として縞を流す。"""
+    body = html.escape(text)
+    if frac is None:
+        track = '<div class="pg-track pg-ind"><div class="pg-fill"></div></div>'
+    else:
+        pct = max(0.0, min(1.0, frac)) * 100
+        track = f'<div class="pg-track"><div class="pg-fill" style="width:{pct:.1f}%"></div></div>'
+    return f'<div class="pg"><div class="pg-text">{body}</div>{track}</div>'
+
+
+def _note(text: str) -> str:
+    """バーを出さない一言（中止しました、先に生成してください、など）。"""
+    return f'<div class="pg pg-note"><div class="pg-text">{html.escape(text)}</div></div>'
+
 
 ASPECTS = {
     "縦 (プリセット)": None,
@@ -69,9 +91,9 @@ def on_model_change(ckpt):
     threading.Thread(target=worker, daemon=True).start()
     # ロード中は status もプリセット欄も触らない。動いている印は progress だけに出す
     _hold = (gr.skip(),) * 7
-    yield ("モデルを準備しています...", *_hold)
+    yield (_bar("モデルを準備しています..."), *_hold)
     while (text := q.get()) is not None:
-        yield (text, *_hold)
+        yield (_bar(text), *_hold)
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
@@ -198,23 +220,23 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
     threading.Thread(target=worker, daemon=True).start()
     # 前回の結果を残したままだと「生成中」の表示と一緒に前の絵が見え、
     # それが今まさに生成中の絵だと誤解される。開始時点で必ず空にする
-    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip(), gr.skip()
+    yield gr.update(value=[], selected_index=None), _bar("準備しています..."), gr.skip(), gr.skip()
     while (msg := q.get()) is not None:
         if msg[0] == "phase":
-            yield gr.update(), msg[1], gr.skip(), gr.skip()
+            yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
             continue
         _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, f"生成中... {s}/{total} step（途中プレビュー）", gr.skip(), gr.skip()
+            yield imgs, _bar(f"生成中... {s}/{total} step（途中プレビュー）", s / total), gr.skip(), gr.skip()
         else:
-            yield gr.update(), f"生成中... {s}/{total} step", gr.skip(), gr.skip()
+            yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
 
     images, used_seed, perf = res["out"]
     if images is None:  # 中止された
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip(), gr.skip()
+        yield gr.update(), _note("中止しました（画像は保存されません）"), gr.skip(), gr.skip()
         return
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -261,7 +283,7 @@ def on_upscale(last, idx):
     engine.upscale 側の実装は残してあるので、戻したくなれば差し替えられる。
     """
     if not last or not last.get("images"):
-        yield gr.update(), "先に画像を生成してください。", gr.skip(), gr.skip()
+        yield gr.update(), _note("先に画像を生成してください。"), gr.skip(), gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
@@ -269,7 +291,7 @@ def on_upscale(last, idx):
     seeds = last.get("seeds") or []
     seed = seeds[i] if i < len(seeds) else last.get("seed", 0)
 
-    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip(), gr.skip()
+    yield gr.update(value=[], selected_index=None), _bar("準備しています..."), gr.skip(), gr.skip()
 
     q: queue.Queue = queue.Queue()
     res = {}
@@ -286,7 +308,7 @@ def on_upscale(last, idx):
 
     threading.Thread(target=worker, daemon=True).start()
     while (text := q.get()) is not None:
-        yield gr.update(), text, gr.skip(), gr.skip()
+        yield gr.update(), _bar(text), gr.skip(), gr.skip()
 
     if "err" in res:
         e = res["err"]
@@ -401,7 +423,7 @@ def on_refresh_favorites():
 def on_variations(last, idx):
     """選択中の画像の seed を保ったまま、少しだけ違う絵を 4 枚出す。"""
     if not last or not last.get("images"):
-        yield gr.update(), "先に画像を生成してください。", gr.skip(), gr.skip()
+        yield gr.update(), _note("先に画像を生成してください。"), gr.skip(), gr.skip()
         return
     images = last["images"]
     i = 0 if idx is None else min(int(idx), len(images) - 1)
@@ -428,23 +450,23 @@ def on_variations(last, idx):
 
     threading.Thread(target=worker, daemon=True).start()
     # 選択も解除する（前の絵を選んだままだと新しい結果と対応がずれる）
-    yield gr.update(value=[], selected_index=None), "準備しています...", gr.skip(), gr.skip()
+    yield gr.update(value=[], selected_index=None), _bar("準備しています..."), gr.skip(), gr.skip()
     while (msg := q.get()) is not None:
         if msg[0] == "phase":
-            yield gr.update(), msg[1], gr.skip(), gr.skip()
+            yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
             continue
         _, s, total, imgs = msg
         if imgs is not None:
-            yield imgs, f"変分を生成中... {s}/{total} step（途中プレビュー）", gr.skip(), gr.skip()
+            yield imgs, _bar(f"変分を生成中... {s}/{total} step（途中プレビュー）", s / total), gr.skip(), gr.skip()
         else:
-            yield gr.update(), f"変分を生成中... {s}/{total} step", gr.skip(), gr.skip()
+            yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
 
     out, _, perf = res["out"]
     if out is None:
-        yield gr.update(), "中止しました（画像は保存されません）", gr.skip(), gr.skip()
+        yield gr.update(), _note("中止しました（画像は保存されません）"), gr.skip(), gr.skip()
         return
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -585,7 +607,7 @@ def fav_button_state(which, last, picked, hist_sel):
 def on_variations_target(which, last, picked, hist_sel):
     state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
-        yield gr.update(), msg, gr.skip(), gr.skip()
+        yield gr.update(), _note(msg), gr.skip(), gr.skip()
         return
     yield from on_variations(state, idx)
 
@@ -593,7 +615,7 @@ def on_variations_target(which, last, picked, hist_sel):
 def on_upscale_target(which, last, picked, hist_sel):
     state, idx, msg = _target(which, last, picked, hist_sel)
     if msg:
-        yield gr.update(), msg, gr.skip(), gr.skip()
+        yield gr.update(), _note(msg), gr.skip(), gr.skip()
         return
     yield from on_upscale(state, idx)
 
@@ -699,12 +721,6 @@ with gr.Blocks(title="PuniGen") as demo:
                             seed = gr.Number(-1, label="Seed (-1 でランダム)", precision=0)
 
                 with gr.Column(scale=1):
-                    # 進行中のことだけを出す 1 行。空にすると行ごと消えるので、
-                    # 待ちが無いときは場所を取らない。
-                    # 「いま何をしているか」の置き場はここ 1 箇所に限る。
-                    # モデルの確定状態は左の status、完成した絵の情報は下の info と
-                    # 役割を分け、同じ文言が 2 箇所に出ないようにしている
-                    progress = gr.Markdown("", elem_id="progress_line")
                     # 今回の生成結果と過去の履歴を、同じ場所でサブタブとして切り替える。
                     # 下のボタンは 1 組だけ置き、開いている側の画像に作用させる
                     with gr.Tabs() as out_tabs:
@@ -731,6 +747,12 @@ with gr.Blocks(title="PuniGen") as demo:
                             "", variant="secondary", scale=1,
                             elem_classes=FAV_CLASS,
                         )
+                    # 進行中のことだけを出す 1 行。生成情報のすぐ上に置く。
+                    # 空にすると行ごと消えるので、待ちが無いときは場所を取らない。
+                    # 「いま何をしているか」の置き場はここ 1 箇所に限る。
+                    # モデルの確定状態は左の status、完成した絵の情報は下の info と
+                    # 役割を分け、同じ文言が 2 箇所に出ないようにしている
+                    progress = gr.HTML("", elem_id="progress_line")
                     info = gr.Textbox(label="生成情報", interactive=False, lines=3)
 
                     # 直前の生成条件（高解像度化で同じプロンプト・設定を再現するため）と

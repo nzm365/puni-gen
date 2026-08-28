@@ -16,10 +16,11 @@
    （試したところ、タグがそのまま文字として表示された）。
    そこで app.py 側は状態をクラス名で伝えるだけにし、星はここで背景画像として描く。
 
-3. 進捗の 1 行を「進行中の表示」として見せる
-   ただの本文と同じ見た目だと、待たされている最中の案内だと分からない。
-   左に色帯を付けて他の文字と区別する。中身が空のときは <p> 自体が無いので、
-   何も待っていないときは高さを持たず場所も取らない。
+3. 進捗バーを描く
+   待ちには 2 種類ある。step 数のように残りが数えられるものは、実際の割合まで
+   伸びるバーで出す。モデルの読み込みのように数えられないものは、割合を偽らずに
+   縞を流し続けて「止まっていない」ことだけを示す。
+   app.py が中身を空にすると要素ごと消えるので、待ちが無いときは場所を取らない。
 """
 from __future__ import annotations
 
@@ -52,19 +53,58 @@ gradio-app {
     zoom: __ZOOM__%;
 }
 
-/* ---- 進捗の 1 行 ----
-   app.py の progress（ギャラリー直上）専用。「いま何をしているか」はここだけに出る。
-   空文字を入れると <p> ごと消えるので、待ちが無いときは行が畳まれる。 */
+/* ---- 進捗バー ----
+   app.py の progress（生成情報の直上）専用。「いま何をしているか」はここだけに出る。
+   空文字を入れると中身ごと消えるので、待ちが無いときは行が畳まれる。 */
 #progress_line {
     min-height: 0;
 }
-#progress_line p {
+#progress_line .pg {
     margin: 0 0 6px;
-    padding: 6px 10px;
-    border-left: 3px solid var(--color-accent, #f97316);
-    background: var(--background-fill-secondary);
-    border-radius: 4px;
-    font-size: 0.92em;
+}
+#progress_line .pg-text {
+    font-size: 0.9em;
+    color: var(--body-text-color-subdued, #71717a);
+    margin-bottom: 4px;
+}
+#progress_line .pg-track {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--background-fill-secondary, #e4e4e7);
+    overflow: hidden;
+}
+#progress_line .pg-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--color-accent, #f97316);
+    transition: width 0.2s ease;
+}
+
+/* 残りが数えられない待ち。割合を偽らず、縞を流して動いていることだけを示す。
+   縞は -45 度なので、横方向の 1 周期は 20px / cos45 = 28.28px。
+   その分だけ動かすと切れ目なくつながる */
+#progress_line .pg-ind .pg-fill {
+    width: 100%;
+    background: repeating-linear-gradient(
+        -45deg,
+        var(--color-accent, #f97316) 0 10px,
+        transparent 10px 20px
+    );
+    animation: pg-slide 0.9s linear infinite;
+}
+@keyframes pg-slide {
+    from { background-position: 0 0; }
+    to { background-position: 28.28px 0; }
+}
+
+/* 一言だけのとき（中止しました、など）はバーを出さない */
+#progress_line .pg-note .pg-text {
+    margin-bottom: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #progress_line .pg-ind .pg-fill { animation: none; opacity: 0.6; }
+    #progress_line .pg-fill { transition: none; }
 }
 
 /* ---- お気に入りボタンの星 ----
