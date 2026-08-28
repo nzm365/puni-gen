@@ -31,9 +31,9 @@ engine = Engine()
 # ギャラリー下の 1 行に出す HTML を組み立てる。「いま何をしているか」はここだけに出す。
 # 待ちには 2 種類あり、見た目を分けている:
 #   - step 数のように残りが数えられるもの  -> 実際の割合まで伸びるバー
-#   - モデルの読み込みのように数えられないもの -> 縞が流れ続けるバー（止まっていない印）
+#   - モデルの読み込みのように数えられないもの -> 丸い塊が往復するバー（止まっていない印）
 def _bar(text: str, frac: float | None = None) -> str:
-    """進捗バー。frac が None なら割合不明として縞を流す。"""
+    """進捗バー。frac が None なら割合不明として塊を往復させる。"""
     body = html.escape(text)
     if frac is None:
         track = '<div class="pg-track pg-ind"><div class="pg-fill"></div></div>'

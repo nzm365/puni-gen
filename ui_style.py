@@ -19,7 +19,9 @@
 3. 進捗バーを描く
    待ちには 2 種類ある。step 数のように残りが数えられるものは、実際の割合まで
    伸びるバーで出す。モデルの読み込みのように数えられないものは、割合を偽らずに
-   縞を流し続けて「止まっていない」ことだけを示す。
+   丸い塊を左右に往復させて「止まっていない」ことだけを示す。
+   往復の折り返しで横に伸び縮みさせているのは、PuniGen の名前のとおり
+   柔らかい印象にするため（縞模様も試したが、角が立って固い見た目になった）。
    app.py が中身を空にすると要素ごと消えるので、待ちが無いときは場所を取らない。
 """
 from __future__ import annotations
@@ -68,33 +70,32 @@ gradio-app {
     margin-bottom: 4px;
 }
 #progress_line .pg-track {
-    height: 6px;
-    border-radius: 3px;
-    background: var(--background-fill-secondary, #e4e4e7);
+    height: 8px;
+    border-radius: 999px;
+    background: var(--background-fill-secondary, #ececf1);
     overflow: hidden;
 }
 #progress_line .pg-fill {
     height: 100%;
-    border-radius: 3px;
-    background: var(--color-accent, #f97316);
-    transition: width 0.2s ease;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #fdba74, var(--color-accent, #f97316));
+    transition: width 0.25s ease;
 }
 
-/* 残りが数えられない待ち。割合を偽らず、縞を流して動いていることだけを示す。
-   縞は -45 度なので、横方向の 1 周期は 20px / cos45 = 28.28px。
-   その分だけ動かすと切れ目なくつながる */
+/* 残りが数えられない待ち。丸い塊が左右を往復する。
+   translateX と scaleX だけで動かすので、毎フレームのレイアウト計算が要らない。
+   幅 32% の塊を自分の幅の 212% ぶん動かすと 32 + 32*2.12 = 99.8%、
+   ちょうど端から端まで届く。折り返しは alternate に任せる。
+   中間で scaleX を 1.35 に膨らませ、伸びて縮む柔らかい動きにしている */
 #progress_line .pg-ind .pg-fill {
-    width: 100%;
-    background: repeating-linear-gradient(
-        -45deg,
-        var(--color-accent, #f97316) 0 10px,
-        transparent 10px 20px
-    );
-    animation: pg-slide 0.9s linear infinite;
+    width: 32%;
+    transform-origin: center;
+    animation: pg-puni 1.3s cubic-bezier(0.45, 0, 0.55, 1) infinite alternate;
 }
-@keyframes pg-slide {
-    from { background-position: 0 0; }
-    to { background-position: 28.28px 0; }
+@keyframes pg-puni {
+    from { transform: translateX(0) scaleX(1); }
+    50%  { transform: translateX(106%) scaleX(1.35); }
+    to   { transform: translateX(212%) scaleX(1); }
 }
 
 /* 一言だけのとき（中止しました、など）はバーを出さない */
@@ -103,7 +104,12 @@ gradio-app {
 }
 
 @media (prefers-reduced-motion: reduce) {
-    #progress_line .pg-ind .pg-fill { animation: none; opacity: 0.6; }
+    /* 動きを止める設定では往復させず、控えめな塊を中央に置くだけにする */
+    #progress_line .pg-ind .pg-fill {
+        animation: none;
+        transform: translateX(106%);
+        opacity: 0.55;
+    }
     #progress_line .pg-fill { transition: none; }
 }
 
