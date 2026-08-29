@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import gc
 import json
+import subprocess
 import threading
 import time
 from collections import OrderedDict
@@ -118,6 +119,55 @@ def safe_vae_dtype() -> torch.dtype:
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float32
+
+
+def _smi_free_bytes() -> int | None:
+    """nvidia-smi が報告する空き VRAM。取れなければ None。
+
+    Windows (WDDM) では torch.cuda.mem_get_info() が他プロセスの確保を反映しない。
+    自分で確保した分は減るが、他のアプリが掴んでいる分は見えず、
+    「OS が他を追い出せば自分が取れる量」に近い値が返る。実測:
+
+        他プロセスが 3GB 保持   nvidia-smi 6.7GB / torch 10.8GB（保持前と同じ）
+
+    その値を信じて常駐で載せると、実際には物理 VRAM に収まらず共有メモリへ
+    溢れ、生成が 0.62s/step から 16.16s/step まで落ちた（同一 seed で 25 倍）。
+    ドライバ同梱の nvidia-smi は物理的な空きを返すので、こちらも見て小さい方を採る。
+
+    GPU が複数ある場合は、どの行が torch の見ている GPU なのかを
+    CUDA_VISIBLE_DEVICES 次第で取り違えうるため、諦めて None を返す
+    （従来どおり torch の値だけで判定する。今より悪くはならない）。
+    """
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+            # Windows で一瞬コンソールが開くのを防ぐ
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None  # nvidia-smi が無い / 応答しない
+    if r.returncode != 0:
+        return None
+    lines = [x.strip() for x in r.stdout.splitlines() if x.strip()]
+    if len(lines) != 1:  # 0 台 or 複数台。取り違えるより使わない
+        return None
+    try:
+        return int(lines[0]) * 1024 * 1024
+    except ValueError:
+        return None
+
+
+def free_vram_bytes() -> int:
+    """いま実際に使える VRAM。torch と nvidia-smi の小さい方を採る。
+
+    小さい方にするのは、多く見積もって載せてしまう方が害が大きいため。
+    載らないものを弾きすぎても「他のアプリを閉じてください」と案内が出るだけだが、
+    載せてしまうと共有メモリへ溢れて、原因の分からない激遅状態になる。
+    """
+    free = torch.cuda.mem_get_info()[0]
+    smi = _smi_free_bytes()
+    return free if smi is None else min(free, smi)
 
 
 class InsufficientVram(RuntimeError):
@@ -325,7 +375,9 @@ class Engine:
         # 総容量ではなく「今の空き」で判定する。他のアプリ (ゲーム・録画・dwm) が
         # VRAM を掴んでいると、総容量では載る計算でも実際には共有メモリに溢れて
         # 生成が数十倍遅くなる（進捗バーが 0 のまま動かないように見える）。
-        vram = torch.cuda.mem_get_info()[0] / 1024**3
+        # 空きの取り方は free_vram_bytes を参照。torch の値だけでは他プロセスの
+        # 確保が見えず、この判定が素通りしてしまう
+        vram = free_vram_bytes() / 1024**3
         size = fp16_footprint(path)
         if size is None:
             # 見積れない形式。弾かずに載せてみるが、VRAM が小さいなら安全側 (オフロード) に倒す
