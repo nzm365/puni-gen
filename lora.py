@@ -53,11 +53,20 @@ def path_of(name: str) -> Path | None:
     return p if p.exists() else None
 
 
-# SDXL の UNet / テキストエンコーダに含まれる名前。LoRA のキーがどれにも当たらない
-# なら、別の構造のモデル向けに作られたもので、このツールでは当てる先が無い。
-# （実際に Anima という DiT 構造のモデル用 LoRA を掴んで、当てる先が無いまま
-#   進んで落ちたことがある）
-_SDXL_MARKERS = ("down_blocks", "up_blocks", "mid_block", "attn1", "attn2", "to_q", "to_k")
+# SDXL 固有の名前。LoRA のキーがどれにも当たらないなら、別の構造のモデル向けに
+# 作られたもので、このツールでは当てる先が無い。
+#
+# to_q / to_k / attn1 のような一般的な名前は使わない。DiT 構造のモデルにも同じ
+# 名前があり、実際 zimage 用の LoRA が to_q に 60 件当たって SDXL と誤判定された。
+# ここに並べるのは「SDXL の UNet かテキストエンコーダにしか出てこない」名前だけ。
+_SDXL_MARKERS = (
+    "lora_unet_",                                # kohya 形式
+    "lora_te_", "lora_te1_", "lora_te2_",        # 同上（テキストエンコーダ）
+    "unet.",                                     # diffusers 形式
+    "text_encoder.", "text_encoder_2.",
+    "down_blocks", "up_blocks", "mid_block",     # SDXL UNet のブロック名
+    "input_blocks", "output_blocks", "middle_block",
+)
 
 
 def inspect(name: str) -> tuple[bool, str]:
