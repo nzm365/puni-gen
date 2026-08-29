@@ -3,7 +3,7 @@ PuniGen（ぷにじぇん）はdiffusers ベースの SDXL / Illustrious 系画�
 `setup.bat` と `start.bat` を順に実行すれば動きます。
 
 複雑なことはできません。手元にグラボがあるからとりあえず画像生成を試してみたい方にお勧めです。
-LoRA には対応しています。ControlNet には対応していないので、必要な方は ComfyUI を使ってください。
+複雑なことをしたい人はComfyUIをお勧めします。
 
 **P**uni **U**ses **N**o **I**ntricacy.
 
