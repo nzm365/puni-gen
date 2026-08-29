@@ -18,6 +18,7 @@ import requests
 
 ROOT = Path(__file__).parent
 CKPT_DIR = ROOT / "models" / "checkpoints"
+LORA_DIR = ROOT / "models" / "loras"
 CONFIG = ROOT / "config.local.json"
 THUMB_DIR = ROOT / ".thumb_cache"
 
@@ -26,6 +27,14 @@ API = "https://civitai.com/api/v1"
 # ダウンロード URL は Civitai 生成のはずだが、API 応答が偽装された場合に
 # API キー (Bearer) を無関係なホストへ送らないよう、送信先を限定する。
 ALLOWED_DOWNLOAD_HOSTS = {"civitai.com", "www.civitai.com"}
+
+# 落とすものの種類と、その保存先。LoRA も同じ検索・ダウンロードの仕組みに乗せる
+KINDS = {"Checkpoint": CKPT_DIR, "LORA": LORA_DIR}
+
+
+def _dir_for(kind: str) -> Path:
+    """種類に対応する保存先。未知の種類はチェックポイント扱いにする。"""
+    return KINDS.get(kind, CKPT_DIR)
 
 
 def _safe_name(name: str, fallback: str) -> str:
@@ -70,6 +79,8 @@ class Candidate:
     thumb_path: str | None
     creator: str
     downloads: int
+    # "Checkpoint" か "LORA"。保存先と、既にあるかの判定先が変わる
+    kind: str = "Checkpoint"
 
     @property
     def label(self) -> str:
@@ -81,7 +92,7 @@ class Candidate:
 
     @property
     def exists(self) -> bool:
-        return (CKPT_DIR / self.file_name).exists()
+        return (_dir_for(self.kind) / self.file_name).exists()
 
 
 # ---------- API キー ----------
@@ -184,8 +195,8 @@ def _get_models(params: list[tuple[str, str]], attempts: int = 4) -> list[dict]:
     )
 
 
-def search(query: str, limit: int = 20) -> list[Candidate]:
-    params = [("types", "Checkpoint"), ("limit", str(limit)), ("sort", "Most Downloaded")]
+def search(query: str, limit: int = 20, kind: str = "Checkpoint") -> list[Candidate]:
+    params = [("types", kind), ("limit", str(limit)), ("sort", "Most Downloaded")]
     if query.strip():
         params.append(("query", query.strip()))
     params += [("baseModels", b) for b in SDXL_BASE_MODELS]
@@ -217,6 +228,7 @@ def search(query: str, limit: int = 20) -> list[Candidate]:
                 thumb_path=_thumb(version, _safe_name(str(version.get("id")), "thumb")),
                 creator=(item.get("creator") or {}).get("username", "?"),
                 downloads=(item.get("stats") or {}).get("downloadCount", 0),
+                kind=kind,
             ))
             break  # 1 モデルにつき最新の SDXL 系バージョン 1 つだけ出す
     return out
@@ -241,11 +253,12 @@ def download(cand: Candidate, on_progress=None) -> str:
     if host.lower() not in ALLOWED_DOWNLOAD_HOSTS:
         raise CivitaiError(f"想定外のダウンロード先のため中止しました: {host or cand.download_url}")
 
-    CKPT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = _dir_for(cand.kind)
+    out_dir.mkdir(parents=True, exist_ok=True)
     # 保存名を再度サニタイズし、解決後のパスが checkpoints 配下に収まることを保証する
     safe = _safe_name(cand.file_name, "model.safetensors")
-    dest = (CKPT_DIR / safe).resolve()
-    if CKPT_DIR.resolve() not in dest.parents:
+    dest = (out_dir / safe).resolve()
+    if out_dir.resolve() not in dest.parents:
         raise CivitaiError("保存先が不正です（ファイル名を確認してください）。")
     if dest.exists():
         return f"すでに {safe} があります（ダウンロードは不要）。"
@@ -253,7 +266,7 @@ def download(cand: Candidate, on_progress=None) -> str:
     part = dest.with_name(dest.name + ".part")
     done = part.stat().st_size if part.exists() else 0
 
-    free = shutil.disk_usage(CKPT_DIR).free
+    free = shutil.disk_usage(out_dir).free
     if cand.size_bytes and free < cand.size_bytes - done + 1024**3:
         raise CivitaiError(
             f"ディスクの空きが足りません。必要 {cand.size_gb:.1f}GB に対し、"
@@ -305,4 +318,5 @@ def download(cand: Candidate, on_progress=None) -> str:
         )
 
     part.rename(dest)
-    return f"{safe} を保存しました。モデル一覧から選べます。"
+    where = "LoRA 一覧" if cand.kind == "LORA" else "モデル一覧"
+    return f"{safe} を保存しました。{where}から選べます。"

@@ -32,6 +32,9 @@ engine = Engine()
 # 「選んでいない」を表す値。Dropdown は空文字を選択なしと区別しにくいので明示する
 LORA_NONE = "（なし）"
 
+# 「モデルを追加」タブの種類。画面のラベルと Civitai の types 値の対応
+KIND_LABELS = {"チェックポイント": "Checkpoint", "LoRA": "LORA"}
+
 
 def lora_choices() -> list[str]:
     return [LORA_NONE] + lora.list_loras()
@@ -767,10 +770,10 @@ def on_favorite_target(which, last, picked, hist_sel):
 
 
 # ---------- モデルを追加（Civitai） ----------
-def on_search(query):
+def on_search(query, kind_label):
     """検索してギャラリー用の (画像, キャプション) 一覧を返す。"""
     try:
-        cands = civitai.search(query)
+        cands = civitai.search(query, kind=KIND_LABELS.get(kind_label, "Checkpoint"))
     except civitai.CivitaiError as e:
         return [], [], f"⚠ {e}", None
     if not cands:
@@ -795,17 +798,22 @@ def on_select(cands, evt: gr.SelectData):
 
 
 def on_download(cands, idx, progress=gr.Progress()):
-    """選択中のモデルを落とし、モデル一覧を更新する。"""
+    """選択中のものを落とし、落とした種類に応じて一覧を更新する。"""
+    hold = (gr.skip(),) * (1 + lora.MAX)
     if idx is None:
-        return "先に一覧からモデルを選んでください。", gr.update()
+        return ("先に一覧から選んでください。", *hold)
+    cand = cands[idx]
     try:
         msg = civitai.download(
-            cands[idx],
+            cand,
             on_progress=lambda frac, text: progress(frac, desc=f"ダウンロード中 {text}"),
         )
     except civitai.CivitaiError as e:
-        return f"⚠ {e}", gr.update()
-    return msg, gr.update(choices=list_checkpoints())
+        return (f"⚠ {e}", *hold)
+    if cand.kind == "LORA":
+        # 選択中の値はそのまま残る（増えるだけなので選択肢から消えることはない）
+        return (msg, gr.skip(), *[gr.update(choices=lora_choices())] * lora.MAX)
+    return (msg, gr.update(choices=list_checkpoints()), *(gr.skip(),) * lora.MAX)
 
 
 emb_tokens = sorted(p.stem for p in EMB_DIR.glob("*.safetensors"))
@@ -932,8 +940,8 @@ with gr.Blocks(title="PuniGen") as demo:
 
         with gr.Tab("モデルを追加", id="models"):
             gr.Markdown(
-                "Civitai から SDXL / Illustrious 系のチェックポイントを検索して追加します。"
-                "ダウンロードには Civitai の API キーが必要です。"
+                "Civitai から SDXL / Illustrious 系のチェックポイントと LoRA を検索して"
+                "追加します。ダウンロードには Civitai の API キーが必要です。"
             )
             with gr.Accordion("API キー設定", open=not civitai.load_token()):
                 gr.Markdown(
@@ -948,6 +956,9 @@ with gr.Blocks(title="PuniGen") as demo:
                     token_save = gr.Button("保存", scale=0)
                 token_status = gr.Markdown("")
 
+            kind = gr.Radio(
+                list(KIND_LABELS), value="チェックポイント", label="種類",
+            )
             with gr.Row():
                 query = gr.Textbox(
                     label="検索", placeholder="illustrious, anime, pony ...",
@@ -960,7 +971,7 @@ with gr.Blocks(title="PuniGen") as demo:
                 object_fit="cover", preview=False,
             )
             detail = gr.Markdown("")
-            dl_btn = gr.Button("選択したモデルをダウンロード", variant="primary")
+            dl_btn = gr.Button("選択したものをダウンロード", variant="primary")
             dl_status = gr.Markdown("")
 
             cands_state = gr.State([])
@@ -979,10 +990,12 @@ with gr.Blocks(title="PuniGen") as demo:
 
     token_save.click(civitai.save_token, token_box, token_status)
     search_out = [cands_state, results, dl_status, sel_state]
-    search_btn.click(on_search, query, search_out)
-    query.submit(on_search, query, search_out)
+    search_btn.click(on_search, [query, kind], search_out)
+    query.submit(on_search, [query, kind], search_out)
+    kind.change(on_search, [query, kind], search_out)  # 種類を変えたら検索し直す
     results.select(on_select, cands_state, [sel_state, detail])
-    dl_btn.click(on_download, [cands_state, sel_state], [dl_status, model_dd])
+    # 落とした種類によって、モデル一覧か LoRA 一覧のどちらかを更新する
+    dl_btn.click(on_download, [cands_state, sel_state], [dl_status, model_dd] + lora_dds)
     # 画面の並び (名前, 強度) × 3 をそのまま渡す。lora_items がここから畳む
     lora_inputs = [c for pair in zip(lora_dds, lora_sls) for c in pair]
 
