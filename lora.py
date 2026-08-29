@@ -92,6 +92,17 @@ def inspect(name: str) -> tuple[bool, str]:
     return False, "SDXL 用の LoRA ではないようです"
 
 
+def adapter_name(name: str) -> str:
+    """PEFT に渡せる形の名前。
+
+    アダプタ名はそのままモジュール名になるので「.」を含められない
+    （torch が `module name can't contain "."` で弾く）。LoRA のファイル名には
+    バージョン表記の「v1.0」などで普通に「.」が入るため、ここで潰す。
+    画面に出すのは元の名前のままで、この形は内部だけで使う。
+    """
+    return re.sub(r"[^0-9A-Za-z_]", "_", name)
+
+
 def total_bytes(names) -> int:
     """選択中の LoRA の合計サイズ。VRAM の事前判定に足すために使う。"""
     total = 0

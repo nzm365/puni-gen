@@ -416,13 +416,24 @@ class Engine:
             print(f"[lora] {name}: {why}")
             _say(on_phase, f"LoRA を使えません: {name}（{why}）")
             return False
+        adapter = lora.adapter_name(name)
         try:
-            self.pipe.load_lora_weights(str(path), adapter_name=name)
+            self.pipe.load_lora_weights(str(path), adapter_name=adapter)
         except Exception as e:  # noqa: BLE001 — 読めない理由は問わず、続行を優先する
-            print(f"[lora] {name} を読み込めません: {e}")
-            _say(on_phase, f"LoRA を読み込めませんでした: {name}")
-            return False
-        if not self._adapter_registered(name):
+            # diffusers 0.40 は、テキストエンコーダ側の鍵が片方 (te2) だけ無い LoRA を
+            # 読むと、空の rank_dict を掴んで IndexError を投げる。te1 だけを持つ
+            # SDXL の LoRA はごく普通にあるので、これで全部を諦めると使えるものが
+            # ほとんど無くなる。UNet 側は例外より前に載っているので、アダプタが
+            # 登録されていれば「テキストエンコーダ分は当たらなかった」として使う。
+            if not self._adapter_registered(adapter):
+                print(f"[lora] {name} を読み込めません: {e}")
+                _say(on_phase, f"LoRA を読み込めませんでした: {name}")
+                return False
+            print(f"[lora] {name}: UNet 側のみ適用（テキストエンコーダ分は当たらず: {e}）")
+            _say(on_phase, f"LoRA を一部だけ適用しました: {name}")
+            return True
+        print(f"[lora] {name} を読み込みました")
+        if not self._adapter_registered(adapter):
             # 例外は出ないが、当てる先が 1 つも無かった場合。diffusers は警告を出すだけで
             # 進むので、ここで弾かないと後の set_adapters が
             # 「そんなアダプタは無い」で落ちる（実際に踏んだ）
@@ -440,7 +451,8 @@ class Engine:
         if not self._loras:
             return
         self.pipe.set_adapters(
-            [n for n, _ in self._loras], [w for _, w in self._loras]
+            [lora.adapter_name(n) for n, _ in self._loras],
+            [w for _, w in self._loras],
         )
 
     def _swap_lora_adapters(self, items, on_phase=None):
@@ -452,7 +464,7 @@ class Engine:
         keep = {n for n, _ in wanted}
         gone = [n for n, _ in self._loras if n not in keep]
         if gone:
-            self.pipe.delete_adapters(gone)
+            self.pipe.delete_adapters([lora.adapter_name(n) for n in gone])
         have = {n for n, _ in self._loras}
         for name, _ in wanted:
             if name in have:
