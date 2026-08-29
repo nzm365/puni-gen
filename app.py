@@ -311,9 +311,18 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
     if in_image is not None:
         # i2i では入力のアスペクト比を保ち、選択サイズは画素数の目安として使う
         size = fit_size(in_image.size, size[0] * size[1])
+    # プロンプト欄から離れる前に押された場合、タグがまだ本文に残っている。
+    # 画面の見た目はそのままでも、生成には反映されるようにここでも取り込む
+    prompt, tagged = lora.extract(prompt or "")
     full_prompt = (prefix or "") + prompt
     seed, n, steps = int(seed), int(n), int(steps)
     loras = lora_items(lora_vals)
+    if tagged:
+        picked = {name for name, _ in loras}
+        for name, weight in lora.resolve(tagged)[0]:
+            if name not in picked:
+                loras.append((name, weight))
+        loras = loras[:lora.MAX]
 
     # 明示 seed の再実行（生成情報の seed を入れて再現する手順）はキャッシュから即答
     cache_key = None
@@ -1005,8 +1014,10 @@ with gr.Blocks(title="PuniGen") as demo:
     lora_refresh.click(on_lora_refresh, lora_inputs, lora_dds + [lora_note])
 
     # プロンプトに <lora:name:0.8> が貼られたら LoRA 欄へ移す。
-    # 書き換えでこの change がもう一度走るが、二度目はタグが無いので止まる
-    prompt.change(
+    # change だと打鍵のたびにサーバへ往復し（43 文字で 34 回）、
+    # 入力中ずっと読み込み表示がちらつく。欄から離れたときだけにする。
+    # 離れる前に生成を押された場合は on_generate 側でも取り込むので取りこぼさない
+    prompt.blur(
         on_prompt_lora, [prompt] + lora_inputs, [prompt] + lora_inputs + [lora_note]
     )
 
