@@ -22,6 +22,8 @@ from diffusers import (
 )
 
 ROOT = Path(__file__).parent
+import lora
+
 CKPT_DIR = ROOT / "models" / "checkpoints"
 EMB_DIR = ROOT / "models" / "embeddings"
 PRESET_DIR = ROOT / "presets"
@@ -256,6 +258,8 @@ class Engine:
         # いま _lock を握っている処理の名前。待たされた側が「何を待っているのか」を
         # 名指しできるようにするためだけに使う（ロックの正しさには関与しない）
         self._busy: str | None = None
+        # いま載っている LoRA の (名前, 強度)。順序は set_adapters に渡す順と同じ
+        self._loras: list[tuple[str, float]] = []
         self._offload = False
         # (モデル, プロンプト, ネガティブ, clip_skip) → encode_prompt の結果。
         # seed だけ変えて連打する使い方ではテキストエンコーダ 2 基を毎回回す必要がない
@@ -292,7 +296,7 @@ class Engine:
         return f"{self._busy or '別の処理'}が終わるのを待っています..."
 
     # ---------- モデル ----------
-    def load(self, ckpt_name: str, on_phase=None) -> str:
+    def load(self, ckpt_name: str, on_phase=None, loras=()) -> str:
         # ロックが空いていないときだけ待機中と伝える。生成中にモデルを切り替えると
         # ここで数十秒待つが、黙って止まって見えると固まったと誤解される
         if not self._lock.acquire(blocking=False):
@@ -300,18 +304,18 @@ class Engine:
             self._lock.acquire()
         self._busy = "モデルの読み込み"
         try:
-            return self._load_impl(ckpt_name, on_phase)
+            return self._load_impl(ckpt_name, on_phase, loras)
         finally:
             self._busy = None
             self._lock.release()
 
-    def _load_impl(self, ckpt_name: str, on_phase=None) -> str:
-        if self.current == ckpt_name and self.pipe is not None:
+    def _load_impl(self, ckpt_name: str, on_phase=None, loras=(), force=False) -> str:
+        if not force and self.current == ckpt_name and self.pipe is not None:
             return f"already loaded: {ckpt_name}"
         self.unload()
         path = CKPT_DIR / ckpt_name
         _say(on_phase, "空き VRAM を確認しています...")
-        offload, mode = self._plan(path)  # 載らないと分かればここで例外
+        offload, mode = self._plan(path, lora.total_bytes(n for n, _ in loras))
         # ここが全体で最も長い。6GB 級のファイルを読むので数十秒かかる
         gb = path.stat().st_size / 1024**3
         _say(on_phase, f"重みを読み込んでいます... ({gb:.1f}GB)")
@@ -321,8 +325,12 @@ class Engine:
         self.pipe = pipe
         _say(on_phase, "embedding を読み込んでいます...")
         self._load_embeddings()  # オフロードのフックが付く前に済ませる
-        if USE_FUSE_QKV:
-            pipe.fuse_qkv_projections()  # attention の Q/K/V を 1 つの行列積に融合 (+1.2GB)
+        self._load_lora_adapters(loras, on_phase)
+        if USE_FUSE_QKV and not self._loras:
+            # Q/K/V を 1 つの行列積に融合する (+1.2GB)。LoRA は to_q / to_k / to_v に
+            # 別々に層を足すため、融合してしまうと当てる先が消える。LoRA を使うときは
+            # 融合しない（既定は False なので、16GB 以上で有効にした人だけが影響を受ける）
+            pipe.fuse_qkv_projections()
         # i2i パイプは t2i と全コンポーネントを共有する（重みのコピーは発生しない）。
         # オフロードのフックが付く前に作っておく。
         # torch_dtype は必ず明示する。diffusers 0.40 の from_pipe は dtype 未指定だと
@@ -362,8 +370,98 @@ class Engine:
             f"embeddings: {', '.join(self.loaded_embeddings) or 'none'}"
         )
 
+    # ---------- LoRA ----------
+    def _load_lora_adapters(self, items, on_phase=None):
+        """LoRA をアダプタとして載せる。**オフロードを有効にする前に**呼ぶこと。
+
+        順序が逆だと、オフロードのフックが付いたあとのモジュールに層を足すことに
+        なり、デバイス配置が壊れる（重みが CPU と GPU に散らばる）。
+        fuse_lora は使わない。融合すると強度を変えるたびに読み直しになるので、
+        アダプタのまま持っておき、強度は set_adapters で差し替える。
+        """
+        self._loras = []
+        items = [(n, float(w)) for n, w in items]
+        if not items:
+            return
+        for i, (name, weight) in enumerate(items, 1):
+            path = lora.path_of(name)
+            if path is None:
+                continue  # 手元に無いものは呼び出し側が画面に出す
+            _say(on_phase, f"LoRA を読み込んでいます... ({i}/{len(items)} {name})")
+            self.pipe.load_lora_weights(str(path), adapter_name=name)
+            self._loras.append((name, weight))
+        self._push_adapter_weights()
+
+    def _push_adapter_weights(self):
+        """いまの (名前, 強度) をパイプラインに反映する。
+
+        i2i パイプは from_pipe で同じ UNet / テキストエンコーダを共有しているので、
+        こちらに当てれば両方に効く。
+        """
+        if not self._loras:
+            return
+        self.pipe.set_adapters(
+            [n for n, _ in self._loras], [w for _, w in self._loras]
+        )
+
+    def _swap_lora_adapters(self, items, on_phase=None):
+        """常駐時に、載せる LoRA の顔ぶれを入れ替える。
+
+        オフロード中は使えない（上の順序の制約があるため、そちらは作り直す）。
+        """
+        wanted = [(n, float(w)) for n, w in items if lora.path_of(n) is not None]
+        keep = {n for n, _ in wanted}
+        gone = [n for n, _ in self._loras if n not in keep]
+        if gone:
+            self.pipe.delete_adapters(gone)
+        have = {n for n, _ in self._loras}
+        for name, _ in wanted:
+            if name in have:
+                continue
+            _say(on_phase, f"LoRA を読み込んでいます... ({name})")
+            self.pipe.load_lora_weights(str(lora.path_of(name)), adapter_name=name)
+        self._loras = wanted
+        if self._loras:
+            self._push_adapter_weights()
+        else:
+            self.pipe.unload_lora_weights()
+
+    def sync_loras(self, items, on_phase=None) -> bool:
+        """選択中の LoRA に合わせる。作り直しが要ったかどうかを返す。
+
+        強度だけの違いなら set_adapters で重みを差し替えるだけで済ませる。
+        ここでファイルを読み直さないのが肝で、スライダーを動かすたびに
+        数十秒待たされることがなくなる。
+
+        顔ぶれが変わったときは、常駐なら差分だけ入れ替える。オフロード中は
+        「LoRA を載せる → オフロードを有効にする」の順を守る必要があるため、
+        パイプラインごと作り直す（時間がかかるので進捗に出す）。
+        """
+        if self.pipe is None:
+            return False
+        items = [(n, float(w)) for n, w in items]
+        if not self._lock.acquire(blocking=False):
+            _say(on_phase, self._wait_note())
+            self._lock.acquire()
+        self._busy = "LoRA の切り替え"
+        try:
+            if [n for n, _ in self._loras] == [n for n, _ in items]:
+                if self._loras != items:  # 強度だけが違う
+                    self._loras = items
+                    self._push_adapter_weights()
+                return False
+            if self._offload:
+                _say(on_phase, "LoRA を入れ替えるためモデルを読み込み直しています...")
+                self._load_impl(self.current, on_phase, items, force=True)
+                return True
+            self._swap_lora_adapters(items, on_phase)
+            return False
+        finally:
+            self._busy = None
+            self._lock.release()
+
     @staticmethod
-    def _plan(path: Path) -> tuple[bool, str]:
+    def _plan(path: Path, lora_bytes: int = 0) -> tuple[bool, str]:
         """ロード前に VRAM 収支を見て配置を決める。(オフロードするか, 表示用の説明)。
 
         重い from_single_file を呼ぶ前に判定するので、載らないモデルは待たずに弾ける。
@@ -378,12 +476,17 @@ class Engine:
         # 空きの取り方は free_vram_bytes を参照。torch の値だけでは他プロセスの
         # 確保が見えず、この判定が素通りしてしまう
         vram = free_vram_bytes() / 1024**3
+        # LoRA はチェックポイントとは別に常駐する。判定の式は変えず、
+        # 重みの見積りに実ファイルのサイズを足すだけにしてある
+        lora_gb = lora_bytes / 1024**3
         size = fp16_footprint(path)
         if size is None:
             # 見積れない形式。弾かずに載せてみるが、VRAM が小さいなら安全側 (オフロード) に倒す
             offload = vram < LOW_VRAM_GB
             return offload, f"空き VRAM {vram:.1f}GB: {'cpu offload (低速)' if offload else 'gpu'}"
         total, unet = size
+        total += lora_gb
+        unet += lora_gb
         if vram >= total + ACTIVATION_HEADROOM_GB:
             return False, f"空き VRAM {vram:.1f}GB / 重み {total:.1f}GB: gpu"
         if vram >= unet + OFFLOAD_HEADROOM_GB:
@@ -405,6 +508,7 @@ class Engine:
             self.pipe_i2i = None  # 共有コンポーネントなので参照を消すだけでよい
             self.current = None
             self.loaded_embeddings = []
+            self._loras = []
             self._embed_cache.clear()  # GPU 上のテンソルを持っているので必ず捨てる
             self._compel = None  # 前のモデルのテキストエンコーダを掴んだままにしない
             gc.collect()  # パイプラインは循環参照を持つので、明示的に回収してから

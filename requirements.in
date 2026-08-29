@@ -20,6 +20,11 @@ transformers==5.15.1
 accelerate==1.14.0
 safetensors==0.8.0
 
+# LoRA をアダプタとして扱うために要る。これが無いと diffusers は旧来の実装に
+# フォールバックし、名前付きアダプタも set_adapters も使えない
+# （強度を変えるたびに読み直す羽目になる）
+peft==0.20.0
+
 # 画面
 gradio==6.25.0
 pillow==12.3.0
