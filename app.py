@@ -14,6 +14,7 @@ from PIL import Image, PngImagePlugin
 
 import civitai
 import gallery_fix
+import lora
 import prompt_autocomplete
 import ui_style
 import upscaler
@@ -26,6 +27,110 @@ OUT_DIR = Path(__file__).parent / "outputs"
 FAV_DIR = Path(__file__).parent / "favorites"
 EMB_DIR = Path(__file__).parent / "models" / "embeddings"
 engine = Engine()
+
+# ---------- LoRA ----------
+# 「選んでいない」を表す値。Dropdown は空文字を選択なしと区別しにくいので明示する
+LORA_NONE = "（なし）"
+
+# 「モデルを追加」タブの種類。画面のラベルと Civitai の types 値の対応
+KIND_LABELS = {"チェックポイント": "Checkpoint", "LoRA": "LORA"}
+
+
+def lora_choices() -> list[str]:
+    return [LORA_NONE] + lora.list_loras()
+
+
+def lora_items(values) -> list[tuple[str, float]]:
+    """画面の (名前, 強度) × 3 を、実在するものだけの並びに畳む。
+
+    values は [名前1, 強度1, 名前2, 強度2, ...] の順に並んでいる（結線の順）。
+    """
+    picked = [
+        (name, weight)
+        for name, weight in zip(values[0::2], values[1::2])
+        if name and name != LORA_NONE
+    ]
+    found, _ = lora.resolve(picked)
+    return found
+
+
+def lora_problems(values) -> list[tuple[str, str]]:
+    """画面で選ばれているが使えない LoRA の (名前, 理由)。
+
+    「無い」だけでなく「SDXL 用でない」もここで拾う。中身を見ないと分からず、
+    黙って進むと当てる先が無いまま生成されてしまう。
+    """
+    out = []
+    for name in values[0::2]:
+        if not name or name == LORA_NONE:
+            continue
+        usable, why = lora.inspect(name)
+        if not usable:
+            out.append((name, why))
+    return out
+
+
+def on_lora_change(*values):
+    """使えない LoRA を知らせる。黙って捨てると絵が変わった理由が分からなくなる。"""
+    problems = lora_problems(values)
+    if not problems:
+        return ""
+    return " / ".join(f"`{name}` — {why}" for name, why in problems)
+
+
+def on_lora_refresh(*values):
+    """models/loras/ を読み直して選択肢を更新する。選択中の値は残す。"""
+    choices = lora_choices()
+    outs = []
+    for name in values[0::2]:
+        keep = name if name else LORA_NONE
+        # 手元に無い名前も選択肢に足して残す（消すと未解決だったことが伝わらない）
+        c = choices if keep in choices else choices + [keep]
+        outs.append(gr.update(choices=c, value=keep))
+    return (*outs, on_lora_change(*values))
+
+
+def on_prompt_lora(prompt, *values):
+    """プロンプトに混ざった <lora:name:0.8> を LoRA 欄へ移す。
+
+    Civitai などからコピーしてきた文字列をそのまま貼れるようにするため。
+    タグが無いときは何も返さない（gr.skip）。プロンプト欄を書き換えると
+    この change がもう一度走るが、二度目はタグが無いのでここで止まる。
+    """
+    rest, found = lora.extract(prompt or "")
+    if not found:
+        return (gr.skip(),) * (1 + lora.MAX * 2 + 1)
+
+    names = list(values[0::2])
+    weights = list(values[1::2])
+    # いま選ばれているものを前に置き、そのあとに貼られたものを足す
+    current = [(n, w) for n, w in zip(names, weights) if n and n != LORA_NONE]
+    merged: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for name, weight in current + found:
+        if name in seen:
+            continue
+        seen.add(name)
+        merged.append((name, weight))
+    merged = merged[:lora.MAX]  # 上限を超えた分は捨てる（理由は lora.MAX のコメント）
+
+    choices = lora_choices()
+    outs = []
+    for i in range(lora.MAX):
+        if i < len(merged):
+            name, weight = merged[i]
+            c = choices if name in choices else choices + [name]
+            outs.append(gr.update(choices=c, value=name))
+            outs.append(gr.update(value=lora.clamp(weight)))
+        else:
+            outs.append(gr.update(choices=choices, value=LORA_NONE))
+            outs.append(gr.update(value=lora.WEIGHT_DEFAULT))
+    note = on_lora_change(*[
+        x for i in range(lora.MAX)
+        for x in ((merged[i][0], merged[i][1]) if i < len(merged) else (LORA_NONE, 0))
+    ])
+    return (rest, *outs, note)
+
 
 # ---------- 進捗表示 ----------
 # ギャラリー下の 1 行に出す HTML を組み立てる。「いま何をしているか」はここだけに出す。
@@ -68,10 +173,10 @@ ASPECTS = {
 }
 
 
-def load_or_alert(ckpt, on_phase=None) -> str:
+def load_or_alert(ckpt, on_phase=None, loras=()) -> str:
     """VRAM 不足はトレースバックではなく画面のエラー表示にする。"""
     try:
-        return engine.load(ckpt, on_phase=on_phase)
+        return engine.load(ckpt, on_phase=on_phase, loras=loras)
     except InsufficientVram as e:
         raise gr.Error(str(e)) from e
 
@@ -201,19 +306,29 @@ def _save_async(images, paths, params: dict | None = None):
 
 
 def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
-                in_image, strength):
+                in_image, strength, *lora_vals):
     size = ASPECTS[aspect] or tuple(load_preset(ckpt)["size"])
     if in_image is not None:
         # i2i では入力のアスペクト比を保ち、選択サイズは画素数の目安として使う
         size = fit_size(in_image.size, size[0] * size[1])
+    # プロンプト欄から離れる前に押された場合、タグがまだ本文に残っている。
+    # 画面の見た目はそのままでも、生成には反映されるようにここでも取り込む
+    prompt, tagged = lora.extract(prompt or "")
     full_prompt = (prefix or "") + prompt
     seed, n, steps = int(seed), int(n), int(steps)
+    loras = lora_items(lora_vals)
+    if tagged:
+        picked = {name for name, _ in loras}
+        for name, weight in lora.resolve(tagged)[0]:
+            if name not in picked:
+                loras.append((name, weight))
+        loras = loras[:lora.MAX]
 
     # 明示 seed の再実行（生成情報の seed を入れて再現する手順）はキャッシュから即答
     cache_key = None
     if seed >= 0 and in_image is None:
         cache_key = (ckpt, full_prompt, negative, size, steps, float(cfg),
-                     sampler, int(clip_skip), seed, n)
+                     sampler, int(clip_skip), seed, n, tuple(loras))
         hit = RESULT_CACHE.get(cache_key)
         if hit is not None:
             yield (hit[0], _done("生成完了"), hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
@@ -227,8 +342,12 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         try:
             # モデルのロードもここで行う。呼び出し側でやると最初の yield まで
             # 到達せず、その数十秒のあいだ画面が完全に無反応になる
+            phase = lambda t: q.put(("phase", t))  # noqa: E731
             if engine.current != ckpt:
-                load_or_alert(ckpt, on_phase=lambda t: q.put(("phase", t)))
+                load_or_alert(ckpt, on_phase=phase, loras=loras)
+            else:
+                # 顔ぶれが同じなら強度の差し替えだけで済み、読み直しは起きない
+                engine.sync_loras(loras, on_phase=phase)
             res["out"] = engine.generate(
                 full_prompt, negative, size[0], size[1],
                 steps, float(cfg), sampler, int(clip_skip), seed, n,
@@ -460,7 +579,9 @@ def on_variations(last, idx):
     def worker():
         try:
             if engine.current != last["ckpt"]:
-                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)))
+                # いま載っている LoRA を引き継ぐ。落とすと絵の傾向が変わってしまう
+                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)),
+                              loras=engine.loras)
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
@@ -658,10 +779,10 @@ def on_favorite_target(which, last, picked, hist_sel):
 
 
 # ---------- モデルを追加（Civitai） ----------
-def on_search(query):
+def on_search(query, kind_label):
     """検索してギャラリー用の (画像, キャプション) 一覧を返す。"""
     try:
-        cands = civitai.search(query)
+        cands = civitai.search(query, kind=KIND_LABELS.get(kind_label, "Checkpoint"))
     except civitai.CivitaiError as e:
         return [], [], f"⚠ {e}", None
     if not cands:
@@ -686,17 +807,22 @@ def on_select(cands, evt: gr.SelectData):
 
 
 def on_download(cands, idx, progress=gr.Progress()):
-    """選択中のモデルを落とし、モデル一覧を更新する。"""
+    """選択中のものを落とし、落とした種類に応じて一覧を更新する。"""
+    hold = (gr.skip(),) * (1 + lora.MAX)
     if idx is None:
-        return "先に一覧からモデルを選んでください。", gr.update()
+        return ("先に一覧から選んでください。", *hold)
+    cand = cands[idx]
     try:
         msg = civitai.download(
-            cands[idx],
+            cand,
             on_progress=lambda frac, text: progress(frac, desc=f"ダウンロード中 {text}"),
         )
     except civitai.CivitaiError as e:
-        return f"⚠ {e}", gr.update()
-    return msg, gr.update(choices=list_checkpoints())
+        return (f"⚠ {e}", *hold)
+    if cand.kind == "LORA":
+        # 選択中の値はそのまま残る（増えるだけなので選択肢から消えることはない）
+        return (msg, gr.skip(), *[gr.update(choices=lora_choices())] * lora.MAX)
+    return (msg, gr.update(choices=list_checkpoints()), *(gr.skip(),) * lora.MAX)
 
 
 emb_tokens = sorted(p.stem for p in EMB_DIR.glob("*.safetensors"))
@@ -727,6 +853,24 @@ with gr.Blocks(title="PuniGen") as demo:
                         label="プロンプト", lines=4, placeholder="1girl, ...", elem_id="prompt_box"
                     )
                     negative = gr.Textbox(label="ネガティブ", lines=2, elem_id="neg_box")
+
+                    # 行数が lora.MAX 固定なのは、同時に使える数を 3 に決めているため。
+                    # 上限の理由（VRAM ではない）は lora.py の MAX のコメントを参照
+                    with gr.Accordion("LoRA（models/loras/ に置いたもの）", open=False):
+                        _choices = lora_choices()
+                        lora_dds, lora_sls = [], []
+                        for _i in range(lora.MAX):
+                            with gr.Row():
+                                lora_dds.append(gr.Dropdown(
+                                    _choices, value=LORA_NONE, label=f"LoRA {_i + 1}",
+                                    allow_custom_value=True, scale=3,
+                                ))
+                                lora_sls.append(gr.Slider(
+                                    lora.WEIGHT_MIN, lora.WEIGHT_MAX, lora.WEIGHT_DEFAULT,
+                                    step=0.05, label="強度", scale=2,
+                                ))
+                        lora_note = gr.Markdown("", elem_id="lora_note")
+                        lora_refresh = gr.Button("一覧を更新", size="sm")
 
                     with gr.Row():
                         aspect = gr.Radio(list(ASPECTS), value="縦 (プリセット)", label="サイズ")
@@ -805,8 +949,8 @@ with gr.Blocks(title="PuniGen") as demo:
 
         with gr.Tab("モデルを追加", id="models"):
             gr.Markdown(
-                "Civitai から SDXL / Illustrious 系のチェックポイントを検索して追加します。"
-                "ダウンロードには Civitai の API キーが必要です。"
+                "Civitai から SDXL / Illustrious 系のチェックポイントと LoRA を検索して"
+                "追加します。ダウンロードには Civitai の API キーが必要です。"
             )
             with gr.Accordion("API キー設定", open=not civitai.load_token()):
                 gr.Markdown(
@@ -821,6 +965,9 @@ with gr.Blocks(title="PuniGen") as demo:
                     token_save = gr.Button("保存", scale=0)
                 token_status = gr.Markdown("")
 
+            kind = gr.Radio(
+                list(KIND_LABELS), value="チェックポイント", label="種類",
+            )
             with gr.Row():
                 query = gr.Textbox(
                     label="検索", placeholder="illustrious, anime, pony ...",
@@ -833,7 +980,7 @@ with gr.Blocks(title="PuniGen") as demo:
                 object_fit="cover", preview=False,
             )
             detail = gr.Markdown("")
-            dl_btn = gr.Button("選択したモデルをダウンロード", variant="primary")
+            dl_btn = gr.Button("選択したものをダウンロード", variant="primary")
             dl_status = gr.Markdown("")
 
             cands_state = gr.State([])
@@ -852,14 +999,32 @@ with gr.Blocks(title="PuniGen") as demo:
 
     token_save.click(civitai.save_token, token_box, token_status)
     search_out = [cands_state, results, dl_status, sel_state]
-    search_btn.click(on_search, query, search_out)
-    query.submit(on_search, query, search_out)
+    search_btn.click(on_search, [query, kind], search_out)
+    query.submit(on_search, [query, kind], search_out)
+    kind.change(on_search, [query, kind], search_out)  # 種類を変えたら検索し直す
     results.select(on_select, cands_state, [sel_state, detail])
-    dl_btn.click(on_download, [cands_state, sel_state], [dl_status, model_dd])
+    # 落とした種類によって、モデル一覧か LoRA 一覧のどちらかを更新する
+    dl_btn.click(on_download, [cands_state, sel_state], [dl_status, model_dd] + lora_dds)
+    # 画面の並び (名前, 強度) × 3 をそのまま渡す。lora_items がここから畳む
+    lora_inputs = [c for pair in zip(lora_dds, lora_sls) for c in pair]
+
+    # 選ばれた LoRA が手元にあるか、選び直すたびに確かめて知らせる
+    for _dd in lora_dds:
+        _dd.change(on_lora_change, lora_inputs, lora_note)
+    lora_refresh.click(on_lora_refresh, lora_inputs, lora_dds + [lora_note])
+
+    # プロンプトに <lora:name:0.8> が貼られたら LoRA 欄へ移す。
+    # change だと打鍵のたびにサーバへ往復し（43 文字で 34 回）、
+    # 入力中ずっと読み込み表示がちらつく。欄から離れたときだけにする。
+    # 離れる前に生成を押された場合は on_generate 側でも取り込むので取りこぼさない
+    prompt.blur(
+        on_prompt_lora, [prompt] + lora_inputs, [prompt] + lora_inputs + [lora_note]
+    )
+
     go.click(
         on_generate,
         [model_dd, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
-         in_image, strength],
+         in_image, strength] + lora_inputs,
         [gallery, progress, info, last_gen],
     ).then(lambda: None, None, picked).then(fav_button_state, *_fav_args)
     gallery.select(on_pick_result, None, picked).then(
