@@ -397,19 +397,39 @@ class Engine:
                 self._loras.append((name, weight))
         self._push_adapter_weights()
 
-    def _try_load_one(self, path, name: str, on_phase=None) -> bool:
-        """LoRA を 1 つ載せる。読めなければ知らせて False を返す。
+    def _adapter_registered(self, name: str) -> bool:
+        """アダプタが実際に登録されたか。問い合わせられないときは判断しない。"""
+        try:
+            listed = self.pipe.get_list_adapters()
+        except Exception:  # noqa: BLE001
+            return True
+        return any(name in names for names in listed.values())
 
-        壊れたファイルや SDXL 用でない LoRA を掴んだだけで生成ごと落ちると、
+    def _try_load_one(self, path, name: str, on_phase=None) -> bool:
+        """LoRA を 1 つ載せる。載らなければ理由を知らせて False を返す。
+
+        壊れたファイルや、別の構造のモデル用の LoRA を掴んだだけで生成ごと落ちると、
         何が悪かったのか分からないまま止まる。その 1 つを飛ばして続ける。
         """
+        usable, why = lora.inspect(name)
+        if not usable:
+            print(f"[lora] {name}: {why}")
+            _say(on_phase, f"LoRA を使えません: {name}（{why}）")
+            return False
         try:
             self.pipe.load_lora_weights(str(path), adapter_name=name)
-            return True
         except Exception as e:  # noqa: BLE001 — 読めない理由は問わず、続行を優先する
             print(f"[lora] {name} を読み込めません: {e}")
-            _say(on_phase, f"LoRA を読み込めませんでした: {name}（この LoRA は使いません）")
+            _say(on_phase, f"LoRA を読み込めませんでした: {name}")
             return False
+        if not self._adapter_registered(name):
+            # 例外は出ないが、当てる先が 1 つも無かった場合。diffusers は警告を出すだけで
+            # 進むので、ここで弾かないと後の set_adapters が
+            # 「そんなアダプタは無い」で落ちる（実際に踏んだ）
+            print(f"[lora] {name}: 当てる先が見つかりませんでした")
+            _say(on_phase, f"LoRA を当てられませんでした: {name}")
+            return False
+        return True
 
     def _push_adapter_weights(self):
         """いまの (名前, 強度) をパイプラインに反映する。

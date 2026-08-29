@@ -51,24 +51,28 @@ def lora_items(values) -> list[tuple[str, float]]:
     return found
 
 
-def lora_missing(values) -> list[str]:
-    """画面で選ばれているが手元に無い LoRA の名前。"""
-    picked = [
-        (name, weight)
-        for name, weight in zip(values[0::2], values[1::2])
-        if name and name != LORA_NONE
-    ]
-    _, missing = lora.resolve(picked)
-    return missing
+def lora_problems(values) -> list[tuple[str, str]]:
+    """画面で選ばれているが使えない LoRA の (名前, 理由)。
+
+    「無い」だけでなく「SDXL 用でない」もここで拾う。中身を見ないと分からず、
+    黙って進むと当てる先が無いまま生成されてしまう。
+    """
+    out = []
+    for name in values[0::2]:
+        if not name or name == LORA_NONE:
+            continue
+        usable, why = lora.inspect(name)
+        if not usable:
+            out.append((name, why))
+    return out
 
 
 def on_lora_change(*values):
-    """未解決の LoRA を知らせる。黙って捨てると絵が変わった理由が分からなくなる。"""
-    missing = lora_missing(values)
-    if not missing:
+    """使えない LoRA を知らせる。黙って捨てると絵が変わった理由が分からなくなる。"""
+    problems = lora_problems(values)
+    if not problems:
         return ""
-    names = " / ".join(f"`{m}`" for m in missing)
-    return f"見つかりません: {names}（`models/loras/` に置いて「一覧を更新」を押してください）"
+    return " / ".join(f"`{name}` — {why}" for name, why in problems)
 
 
 def on_lora_refresh(*values):

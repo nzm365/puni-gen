@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from safetensors import safe_open
+
 LORA_DIR = Path(__file__).parent / "models" / "loras"
 
 # 同時に使える数の上限。VRAM の都合で決めた値ではない。
@@ -49,6 +51,36 @@ def path_of(name: str) -> Path | None:
     """名前から実ファイルを引く。無ければ None。"""
     p = LORA_DIR / f"{name}.safetensors"
     return p if p.exists() else None
+
+
+# SDXL の UNet / テキストエンコーダに含まれる名前。LoRA のキーがどれにも当たらない
+# なら、別の構造のモデル向けに作られたもので、このツールでは当てる先が無い。
+# （実際に Anima という DiT 構造のモデル用 LoRA を掴んで、当てる先が無いまま
+#   進んで落ちたことがある）
+_SDXL_MARKERS = ("down_blocks", "up_blocks", "mid_block", "attn1", "attn2", "to_q", "to_k")
+
+
+def inspect(name: str) -> tuple[bool, str]:
+    """(SDXL 用として使えそうか, 使えない場合の理由)。
+
+    safetensors はヘッダだけ読めばキー名と metadata が取れるので、
+    264MB のファイルでも一瞬で判定できる。重みは読まない。
+    """
+    path = path_of(name)
+    if path is None:
+        return False, "見つかりません"
+    try:
+        with safe_open(str(path), framework="pt") as f:
+            keys = list(f.keys())
+            meta = f.metadata() or {}
+    except Exception as e:  # noqa: BLE001 — 壊れたファイルもここで弾く
+        return False, f"読み込めません（{e}）"
+    if any(m in k for k in keys for m in _SDXL_MARKERS):
+        return True, ""
+    arch = meta.get("modelspec.architecture") or meta.get("ss_base_model_version") or ""
+    if arch:
+        return False, f"{arch} 用の LoRA のようです（このツールは SDXL 系のみ）"
+    return False, "SDXL 用の LoRA ではないようです"
 
 
 def total_bytes(names) -> int:
