@@ -14,6 +14,7 @@ from PIL import Image, PngImagePlugin
 
 import civitai
 import gallery_fix
+import lora
 import prompt_autocomplete
 import ui_style
 import upscaler
@@ -26,6 +27,103 @@ OUT_DIR = Path(__file__).parent / "outputs"
 FAV_DIR = Path(__file__).parent / "favorites"
 EMB_DIR = Path(__file__).parent / "models" / "embeddings"
 engine = Engine()
+
+# ---------- LoRA ----------
+# 「選んでいない」を表す値。Dropdown は空文字を選択なしと区別しにくいので明示する
+LORA_NONE = "（なし）"
+
+
+def lora_choices() -> list[str]:
+    return [LORA_NONE] + lora.list_loras()
+
+
+def lora_items(values) -> list[tuple[str, float]]:
+    """画面の (名前, 強度) × 3 を、実在するものだけの並びに畳む。
+
+    values は [名前1, 強度1, 名前2, 強度2, ...] の順に並んでいる（結線の順）。
+    """
+    picked = [
+        (name, weight)
+        for name, weight in zip(values[0::2], values[1::2])
+        if name and name != LORA_NONE
+    ]
+    found, _ = lora.resolve(picked)
+    return found
+
+
+def lora_missing(values) -> list[str]:
+    """画面で選ばれているが手元に無い LoRA の名前。"""
+    picked = [
+        (name, weight)
+        for name, weight in zip(values[0::2], values[1::2])
+        if name and name != LORA_NONE
+    ]
+    _, missing = lora.resolve(picked)
+    return missing
+
+
+def on_lora_change(*values):
+    """未解決の LoRA を知らせる。黙って捨てると絵が変わった理由が分からなくなる。"""
+    missing = lora_missing(values)
+    if not missing:
+        return ""
+    names = " / ".join(f"`{m}`" for m in missing)
+    return f"見つかりません: {names}（`models/loras/` に置いて「一覧を更新」を押してください）"
+
+
+def on_lora_refresh(*values):
+    """models/loras/ を読み直して選択肢を更新する。選択中の値は残す。"""
+    choices = lora_choices()
+    outs = []
+    for name in values[0::2]:
+        keep = name if name else LORA_NONE
+        # 手元に無い名前も選択肢に足して残す（消すと未解決だったことが伝わらない）
+        c = choices if keep in choices else choices + [keep]
+        outs.append(gr.update(choices=c, value=keep))
+    return (*outs, on_lora_change(*values))
+
+
+def on_prompt_lora(prompt, *values):
+    """プロンプトに混ざった <lora:name:0.8> を LoRA 欄へ移す。
+
+    Civitai などからコピーしてきた文字列をそのまま貼れるようにするため。
+    タグが無いときは何も返さない（gr.skip）。プロンプト欄を書き換えると
+    この change がもう一度走るが、二度目はタグが無いのでここで止まる。
+    """
+    rest, found = lora.extract(prompt or "")
+    if not found:
+        return (gr.skip(),) * (1 + lora.MAX * 2 + 1)
+
+    names = list(values[0::2])
+    weights = list(values[1::2])
+    # いま選ばれているものを前に置き、そのあとに貼られたものを足す
+    current = [(n, w) for n, w in zip(names, weights) if n and n != LORA_NONE]
+    merged: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for name, weight in current + found:
+        if name in seen:
+            continue
+        seen.add(name)
+        merged.append((name, weight))
+    merged = merged[:lora.MAX]  # 上限を超えた分は捨てる（理由は lora.MAX のコメント）
+
+    choices = lora_choices()
+    outs = []
+    for i in range(lora.MAX):
+        if i < len(merged):
+            name, weight = merged[i]
+            c = choices if name in choices else choices + [name]
+            outs.append(gr.update(choices=c, value=name))
+            outs.append(gr.update(value=lora.clamp(weight)))
+        else:
+            outs.append(gr.update(choices=choices, value=LORA_NONE))
+            outs.append(gr.update(value=lora.WEIGHT_DEFAULT))
+    note = on_lora_change(*[
+        x for i in range(lora.MAX)
+        for x in ((merged[i][0], merged[i][1]) if i < len(merged) else (LORA_NONE, 0))
+    ])
+    return (rest, *outs, note)
+
 
 # ---------- 進捗表示 ----------
 # ギャラリー下の 1 行に出す HTML を組み立てる。「いま何をしているか」はここだけに出す。
@@ -68,10 +166,10 @@ ASPECTS = {
 }
 
 
-def load_or_alert(ckpt, on_phase=None) -> str:
+def load_or_alert(ckpt, on_phase=None, loras=()) -> str:
     """VRAM 不足はトレースバックではなく画面のエラー表示にする。"""
     try:
-        return engine.load(ckpt, on_phase=on_phase)
+        return engine.load(ckpt, on_phase=on_phase, loras=loras)
     except InsufficientVram as e:
         raise gr.Error(str(e)) from e
 
@@ -201,19 +299,20 @@ def _save_async(images, paths, params: dict | None = None):
 
 
 def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
-                in_image, strength):
+                in_image, strength, *lora_vals):
     size = ASPECTS[aspect] or tuple(load_preset(ckpt)["size"])
     if in_image is not None:
         # i2i では入力のアスペクト比を保ち、選択サイズは画素数の目安として使う
         size = fit_size(in_image.size, size[0] * size[1])
     full_prompt = (prefix or "") + prompt
     seed, n, steps = int(seed), int(n), int(steps)
+    loras = lora_items(lora_vals)
 
     # 明示 seed の再実行（生成情報の seed を入れて再現する手順）はキャッシュから即答
     cache_key = None
     if seed >= 0 and in_image is None:
         cache_key = (ckpt, full_prompt, negative, size, steps, float(cfg),
-                     sampler, int(clip_skip), seed, n)
+                     sampler, int(clip_skip), seed, n, tuple(loras))
         hit = RESULT_CACHE.get(cache_key)
         if hit is not None:
             yield (hit[0], _done("生成完了"), hit[1] + "\n(同一設定・同一 seed のため再計算なし)", hit[2])
@@ -227,8 +326,12 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         try:
             # モデルのロードもここで行う。呼び出し側でやると最初の yield まで
             # 到達せず、その数十秒のあいだ画面が完全に無反応になる
+            phase = lambda t: q.put(("phase", t))  # noqa: E731
             if engine.current != ckpt:
-                load_or_alert(ckpt, on_phase=lambda t: q.put(("phase", t)))
+                load_or_alert(ckpt, on_phase=phase, loras=loras)
+            else:
+                # 顔ぶれが同じなら強度の差し替えだけで済み、読み直しは起きない
+                engine.sync_loras(loras, on_phase=phase)
             res["out"] = engine.generate(
                 full_prompt, negative, size[0], size[1],
                 steps, float(cfg), sampler, int(clip_skip), seed, n,
@@ -460,7 +563,9 @@ def on_variations(last, idx):
     def worker():
         try:
             if engine.current != last["ckpt"]:
-                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)))
+                # いま載っている LoRA を引き継ぐ。落とすと絵の傾向が変わってしまう
+                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)),
+                              loras=engine.loras)
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
@@ -728,6 +833,24 @@ with gr.Blocks(title="PuniGen") as demo:
                     )
                     negative = gr.Textbox(label="ネガティブ", lines=2, elem_id="neg_box")
 
+                    # 行数が lora.MAX 固定なのは、同時に使える数を 3 に決めているため。
+                    # 上限の理由（VRAM ではない）は lora.py の MAX のコメントを参照
+                    with gr.Accordion("LoRA（models/loras/ に置いたもの）", open=False):
+                        _choices = lora_choices()
+                        lora_dds, lora_sls = [], []
+                        for _i in range(lora.MAX):
+                            with gr.Row():
+                                lora_dds.append(gr.Dropdown(
+                                    _choices, value=LORA_NONE, label=f"LoRA {_i + 1}",
+                                    allow_custom_value=True, scale=3,
+                                ))
+                                lora_sls.append(gr.Slider(
+                                    lora.WEIGHT_MIN, lora.WEIGHT_MAX, lora.WEIGHT_DEFAULT,
+                                    step=0.05, label="強度", scale=2,
+                                ))
+                        lora_note = gr.Markdown("", elem_id="lora_note")
+                        lora_refresh = gr.Button("一覧を更新", size="sm")
+
                     with gr.Row():
                         aspect = gr.Radio(list(ASPECTS), value="縦 (プリセット)", label="サイズ")
                         n = gr.Slider(1, 4, 1, step=1, label="枚数")
@@ -856,10 +979,24 @@ with gr.Blocks(title="PuniGen") as demo:
     query.submit(on_search, query, search_out)
     results.select(on_select, cands_state, [sel_state, detail])
     dl_btn.click(on_download, [cands_state, sel_state], [dl_status, model_dd])
+    # 画面の並び (名前, 強度) × 3 をそのまま渡す。lora_items がここから畳む
+    lora_inputs = [c for pair in zip(lora_dds, lora_sls) for c in pair]
+
+    # 選ばれた LoRA が手元にあるか、選び直すたびに確かめて知らせる
+    for _dd in lora_dds:
+        _dd.change(on_lora_change, lora_inputs, lora_note)
+    lora_refresh.click(on_lora_refresh, lora_inputs, lora_dds + [lora_note])
+
+    # プロンプトに <lora:name:0.8> が貼られたら LoRA 欄へ移す。
+    # 書き換えでこの change がもう一度走るが、二度目はタグが無いので止まる
+    prompt.change(
+        on_prompt_lora, [prompt] + lora_inputs, [prompt] + lora_inputs + [lora_note]
+    )
+
     go.click(
         on_generate,
         [model_dd, prefix, prompt, negative, aspect, n, steps, cfg, sampler, clip_skip, seed,
-         in_image, strength],
+         in_image, strength] + lora_inputs,
         [gallery, progress, info, last_gen],
     ).then(lambda: None, None, picked).then(fav_button_state, *_fav_args)
     gallery.select(on_pick_result, None, picked).then(

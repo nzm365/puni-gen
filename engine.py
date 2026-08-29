@@ -371,6 +371,11 @@ class Engine:
         )
 
     # ---------- LoRA ----------
+    @property
+    def loras(self) -> list[tuple[str, float]]:
+        """いま載っている LoRA の (名前, 強度)。呼び出し側が書き換えられないよう複製を返す。"""
+        return list(self._loras)
+
     def _load_lora_adapters(self, items, on_phase=None):
         """LoRA をアダプタとして載せる。**オフロードを有効にする前に**呼ぶこと。
 
@@ -388,9 +393,23 @@ class Engine:
             if path is None:
                 continue  # 手元に無いものは呼び出し側が画面に出す
             _say(on_phase, f"LoRA を読み込んでいます... ({i}/{len(items)} {name})")
-            self.pipe.load_lora_weights(str(path), adapter_name=name)
-            self._loras.append((name, weight))
+            if self._try_load_one(path, name, on_phase):
+                self._loras.append((name, weight))
         self._push_adapter_weights()
+
+    def _try_load_one(self, path, name: str, on_phase=None) -> bool:
+        """LoRA を 1 つ載せる。読めなければ知らせて False を返す。
+
+        壊れたファイルや SDXL 用でない LoRA を掴んだだけで生成ごと落ちると、
+        何が悪かったのか分からないまま止まる。その 1 つを飛ばして続ける。
+        """
+        try:
+            self.pipe.load_lora_weights(str(path), adapter_name=name)
+            return True
+        except Exception as e:  # noqa: BLE001 — 読めない理由は問わず、続行を優先する
+            print(f"[lora] {name} を読み込めません: {e}")
+            _say(on_phase, f"LoRA を読み込めませんでした: {name}（この LoRA は使いません）")
+            return False
 
     def _push_adapter_weights(self):
         """いまの (名前, 強度) をパイプラインに反映する。
@@ -419,7 +438,8 @@ class Engine:
             if name in have:
                 continue
             _say(on_phase, f"LoRA を読み込んでいます... ({name})")
-            self.pipe.load_lora_weights(str(lora.path_of(name)), adapter_name=name)
+            if not self._try_load_one(lora.path_of(name), name, on_phase):
+                wanted = [x for x in wanted if x[0] != name]
         self._loras = wanted
         if self._loras:
             self._push_adapter_weights()
