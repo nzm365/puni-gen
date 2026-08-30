@@ -255,6 +255,18 @@ META_KEY = "puni_gen"
 LEGACY_META_KEY = "rtx_easy_image_gen"
 
 
+def _lora_text(loras) -> str:
+    """生成情報に出す LoRA の並び。使っていなければ空文字。"""
+    if not loras:
+        return ""
+    return "lora: " + ", ".join(f"{name}({weight:g})" for name, weight in loras)
+
+
+def _lora_tags(loras) -> str:
+    """A1111 系が読む 1 行表記に足すぶん。あちらは本文中のタグで LoRA を表す。"""
+    return "".join(f" <lora:{name}:{weight:g}>" for name, weight in (loras or []))
+
+
 def _png_meta(params: dict) -> PngImagePlugin.PngInfo:
     """生成条件を PNG のテキストチャンクに詰める。
 
@@ -266,7 +278,7 @@ def _png_meta(params: dict) -> PngImagePlugin.PngInfo:
     info.add_text(META_KEY, json.dumps(params, ensure_ascii=False))
     # A1111 系ツールが読む慣習的な 1 行表記も添えておく
     info.add_text("parameters", (
-        f"{params.get('prompt', '')}\n"
+        f"{params.get('prompt', '')}{_lora_tags(params.get('loras'))}\n"
         f"Negative prompt: {params.get('negative', '')}\n"
         f"Steps: {params.get('steps')}, Sampler: {params.get('sampler')}, "
         f"CFG scale: {params.get('cfg')}, Seed: {params.get('seed')}, "
@@ -389,18 +401,22 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         "sampler": sampler, "clip_skip": int(clip_skip), "steps": steps,
         "size": list(size), "seed": used_seed,
         "seeds": [used_seed + i for i in range(len(images))],
+        # LoRA は絵を大きく変えるので、これが無いと同じ絵を作り直せない
+        "loras": [[name, weight] for name, weight in loras],
     }
     _save_async(images, paths, meta)  # 保存完了を待たずに表示する
     mode = f"i2i (strength {strength})" if in_image is not None else "t2i"
+    lora_line = _lora_text(loras)
     info = (
         f"seed: {used_seed}  size: {size[0]}x{size[1]}  mode: {mode}  prompt: {full_prompt}\n"
-        f"[{perf}]"
+        + (f"{lora_line}\n" if lora_line else "")
+        + f"[{perf}]"
     )
     # 高解像度化で同じ条件を再現するために生成条件を持ち回す
     last = {
         "images": images, "ckpt": ckpt, "prompt": full_prompt, "negative": negative,
         "cfg": float(cfg), "sampler": sampler, "clip_skip": int(clip_skip),
-        "seed": used_seed, "size": size, "steps": steps,
+        "seed": used_seed, "size": size, "steps": steps, "loras": loras,
         # 画像ごとの保存先と seed（お気に入り移動と変分で使う）
         "paths": [str(p) for p in paths],
         "seeds": [used_seed + i for i in range(len(images))],
@@ -466,6 +482,7 @@ def on_upscale(last, idx):
         "negative": last.get("negative", ""), "cfg": last.get("cfg"),
         "sampler": last.get("sampler"), "clip_skip": last.get("clip_skip"),
         "steps": last.get("steps"), "size": list(out[0].size), "seed": seed,
+        "loras": [list(x) for x in (last.get("loras") or [])],
     })
     w, h = out[0].size
     info = (
@@ -578,10 +595,14 @@ def on_variations(last, idx):
 
     def worker():
         try:
+            phase = lambda t: q.put(("phase", t))  # noqa: E731
+            # 元の絵を作ったときの LoRA に合わせる。ここを今の画面の設定にすると、
+            # 履歴から変分を作ったときに別物が出てしまう
+            want = [tuple(x) for x in (last.get("loras") or [])]
             if engine.current != last["ckpt"]:
-                # いま載っている LoRA を引き継ぐ。落とすと絵の傾向が変わってしまう
-                load_or_alert(last["ckpt"], on_phase=lambda t: q.put(("phase", t)),
-                              loras=engine.loras)
+                load_or_alert(last["ckpt"], on_phase=phase, loras=want)
+            else:
+                engine.sync_loras(want, on_phase=phase)
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
@@ -620,10 +641,13 @@ def on_variations(last, idx):
         "ckpt": last["ckpt"], "prompt": last["prompt"], "negative": last["negative"],
         "cfg": last["cfg"], "sampler": last["sampler"], "clip_skip": last["clip_skip"],
         "steps": last["steps"], "size": [w, h], "seed": base_seed,
+        "loras": [list(x) for x in (last.get("loras") or [])],
     })
     info = (
         f"少しだけ変える: seed {base_seed} を維持したまま {len(out)} 枚"
-        f"（元画像: {i + 1} 枚目）\n[{perf}]"
+        f"（元画像: {i + 1} 枚目）\n"
+        + (f"{_lora_text(last.get('loras'))}\n" if last.get("loras") else "")
+        + f"[{perf}]"
     )
     # 出てきた変分をさらに起点にできるよう、状態を差し替える
     nxt = {
@@ -692,6 +716,7 @@ def on_pick_history(evt: gr.SelectData):
         "negative": meta.get("negative", ""), "cfg": meta.get("cfg", 5.0),
         "sampler": meta.get("sampler", "euler_a"), "clip_skip": meta.get("clip_skip", 2),
         "steps": meta.get("steps", 28), "size": meta.get("size", list(img.size)),
+        "loras": [tuple(x) for x in (meta.get("loras") or [])],
     }
     size = meta.get("size") or list(img.size)
     # 生成直後に出る表示と語順を揃えておくと、見比べたときに読みやすい
@@ -699,7 +724,8 @@ def on_pick_history(evt: gr.SelectData):
         f"seed: {meta.get('seed')}  size: {size[0]}x{size[1]}  "
         f"steps: {meta.get('steps')}  cfg: {meta.get('cfg')}  "
         f"{meta.get('sampler')}  clip skip: {meta.get('clip_skip')}\n"
-        f"model: {meta.get('ckpt')}  file: {path.name}\n"
+        + (f"{_lora_text(state['loras'])}\n" if state["loras"] else "")
+        + f"model: {meta.get('ckpt')}  file: {path.name}\n"
         f"prompt: {meta.get('prompt', '')}"
     )
 
