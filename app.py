@@ -933,7 +933,8 @@ def on_download(cands, idx, progress=gr.Progress()):
     try:
         msg = civitai.download(
             cand,
-            on_progress=lambda frac, text: progress(frac, desc=f"ダウンロード中 {text}"),
+            # 何をしているか（ダウンロード中／確認中）は civitai.py 側が文言ごと渡す
+            on_progress=lambda frac, text: progress(frac, desc=text),
         )
     except civitai.CivitaiError as e:
         return (f"⚠ {e}", *hold)

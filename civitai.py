@@ -5,6 +5,7 @@ config.local.json（.gitignore 済み）か環境変数 CIVITAI_TOKEN から読�
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -81,6 +82,9 @@ class Candidate:
     downloads: int
     # "Checkpoint" か "LORA"。保存先と、既にあるかの判定先が変わる
     kind: str = "Checkpoint"
+    # 配布元が公表しているファイルの SHA256（大文字 16 進）。落とした後の照合に使う。
+    # 返ってこないことがあるので、空文字を「照合できない」の意味で持つ
+    sha256: str = ""
 
     @property
     def label(self) -> str:
@@ -229,17 +233,109 @@ def search(query: str, limit: int = 20, kind: str = "Checkpoint") -> list[Candid
                 creator=(item.get("creator") or {}).get("username", "?"),
                 downloads=(item.get("stats") or {}).get("downloadCount", 0),
                 kind=kind,
+                sha256=(f.get("hashes") or {}).get("SHA256", "") or "",
             ))
             break  # 1 モデルにつき最新の SDXL 系バージョン 1 つだけ出す
     return out
+
+
+# ---------- 照合 ----------
+def _file_sha256(path: Path, on_progress=None) -> str:
+    """ファイルの SHA256 を求める。
+
+    6.46GB のチェックポイントで 4.4 秒（1.47GB/s、実測）。ダウンロードの
+    数分に比べれば短いが、その間ずっと画面が黙っていると「固まった」と
+    見えるため、ダウンロード中と同じ要領で読んだ割合を逐次知らせる。
+    """
+    total = path.stat().st_size
+    h = hashlib.sha256()
+    done = 0
+    with path.open("rb") as fp:
+        while chunk := fp.read(CHUNK):
+            h.update(chunk)
+            done += len(chunk)
+            if on_progress and total:
+                on_progress(done / total, f"壊れていないか確認中 {done * 100 // total}%")
+    return h.hexdigest()
+
+
+def _verify(part: Path, cand: Candidate, on_progress=None) -> str:
+    """落としたものが配布元のファイルと同じか確かめ、その SHA256 を返す。
+
+    大きなファイルのダウンロードは途中で化けることがある。壊れたモデルを
+    読み込むと「テンソルが見つからない」のような原因の分かりにくいエラーで
+    落ちるため、モデル一覧に出す前にここで弾く。
+
+    確かめるのは改名より前。壊れたものを .safetensors にしてしまうと、
+    利用者からは正しく落ちたものと見分けが付かなくなる。
+
+    配布元が SHA256 を出していないときは空文字を返す。照合はできないが、
+    ダウンロード自体は成功しているので失敗にはしない。
+    """
+    if not cand.sha256:
+        return ""
+    got = _file_sha256(part, on_progress)
+    if got.lower() != cand.sha256.lower():
+        # 壊れた .part は消す。残すと次に押したときの再開要求が 416 になり、
+        # 「もう全部落ちている」と判断して壊れたまま改名してしまう
+        part.unlink(missing_ok=True)
+        raise CivitaiError(
+            "ダウンロードしたファイルが壊れています（配布元のものと中身が一致しません）。"
+            "途中のファイルは削除したので、もう一度ダウンロードしてください。"
+        )
+    return got
+
+
+def _sidecar(dest: Path) -> Path:
+    """落としたファイルに付随する情報を置く場所。
+
+    models/ 配下は .safetensors だけを一覧に出しているので、
+    隣に .json を置いてもモデル一覧や LoRA 一覧には出てこない。
+    """
+    return dest.with_name(dest.name + ".json")
+
+
+def _record(dest: Path, sha: str) -> None:
+    """確かめた SHA256 を隣の JSON に控える。
+
+    6GB を読み直すには数秒かかるので、一度求めた値は残しておく。
+    既にある内容は消さずキーを足すだけにする。同じファイルを他の用途でも
+    使うとき、互いの書き込みを消し合わないため。
+    """
+    path = _sidecar(dest)
+    data: dict = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (json.JSONDecodeError, OSError):
+            data = {}
+    data["sha256"] = sha
+    try:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass  # 控えられなくてもダウンロードは成功している。必要になったら計算し直せる
+
+
+def _finish(part: Path, dest: Path, cand: Candidate, safe: str, on_progress=None) -> str:
+    """照合 → 改名 → 記録。落としきった経路はすべてここを通す。"""
+    sha = _verify(part, cand, on_progress)
+    part.rename(dest)
+    if sha:
+        _record(dest, sha)
+    where = "LoRA 一覧" if cand.kind == "LORA" else "モデル一覧"
+    note = "" if sha else "（配布元が照合値を出していないため、破損の確認はできていません）"
+    return f"{safe} を保存しました。{where}から選べます。{note}"
 
 
 # ---------- ダウンロード ----------
 def download(cand: Candidate, on_progress=None) -> str:
     """models/checkpoints へ保存し、保存したファイル名を返す。
 
-    中断しても .part に残り、次回は続きから再開する。完全に落ちきってから
-    .safetensors に改名するので、中途半端なファイルがモデル一覧に出ることはない。
+    中断しても .part に残り、次回は続きから再開する。落ちきったら配布元の
+    SHA256 と照合し、そこを通ってから .safetensors に改名するので、
+    中途半端なものや壊れたものがモデル一覧に出ることはない。
     """
     token = load_token()
     if not token:
@@ -289,8 +385,7 @@ def download(cand: Candidate, on_progress=None) -> str:
                 "早期アクセスや購入が必要なモデルの可能性があります。"
             )
         if r.status_code == 416:  # 既に全部落ちている
-            part.rename(dest)
-            return f"{safe} を保存しました。"
+            return _finish(part, dest, cand, safe, on_progress)
         r.raise_for_status()
 
         if done and r.status_code != 206:  # 再開が拒否されたら最初から
@@ -305,7 +400,10 @@ def download(cand: Candidate, on_progress=None) -> str:
                 fp.write(chunk)
                 done += len(chunk)
                 if on_progress and total:
-                    on_progress(done / total, f"{done / 1024**3:.2f} / {total / 1024**3:.2f} GB")
+                    on_progress(
+                        done / total,
+                        f"ダウンロード中 {done / 1024**3:.2f} / {total / 1024**3:.2f} GB",
+                    )
     except requests.RequestException as e:
         raise CivitaiError(
             f"ダウンロードに失敗しました: {e}\n"
@@ -317,6 +415,4 @@ def download(cand: Candidate, on_progress=None) -> str:
             "ダウンロードが途中で終わりました。もう一度押すと続きから再開します。"
         )
 
-    part.rename(dest)
-    where = "LoRA 一覧" if cand.kind == "LORA" else "モデル一覧"
-    return f"{safe} を保存しました。{where}から選べます。"
+    return _finish(part, dest, cand, safe, on_progress)
