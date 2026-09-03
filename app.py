@@ -441,7 +441,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
                 full_prompt, negative, size[0], size[1],
                 steps, float(cfg), sampler, int(clip_skip), seed, n,
                 image=in_image, strength=float(strength),
-                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                step_cb=lambda s, total: q.put(("step", s, total)),
                 on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
@@ -457,11 +457,8 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         if msg[0] == "phase":
             yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
             continue
-        _, s, total, imgs = msg
-        if imgs is not None:
-            yield imgs, _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
-        else:
-            yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
+        _, s, total = msg
+        yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
@@ -683,7 +680,7 @@ def on_variations(last, idx):
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
-                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                step_cb=lambda s, total: q.put(("step", s, total)),
                 on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
@@ -698,11 +695,8 @@ def on_variations(last, idx):
         if msg[0] == "phase":
             yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
             continue
-        _, s, total, imgs = msg
-        if imgs is not None:
-            yield imgs, _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
-        else:
-            yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
+        _, s, total = msg
+        yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
