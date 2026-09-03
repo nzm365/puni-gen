@@ -288,14 +288,91 @@ def _png_meta(params: dict) -> PngImagePlugin.PngInfo:
     return info
 
 
+def meta_from_info(info) -> dict | None:
+    """PIL が持っているテキストチャンクから生成条件を取り出す。
+
+    img2img に置かれた画像はパスではなく PIL の形で渡ってくるので、
+    ファイルを開き直さずにここから読む。
+    """
+    raw = (info or {}).get(META_KEY) or (info or {}).get(LEGACY_META_KEY)
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None
+
+
 def read_meta(path) -> dict | None:
     """PNG から生成条件を読み戻す。無ければ None（古い画像や外部の画像）。"""
     try:
         with Image.open(path) as im:
-            raw = im.info.get(META_KEY) or im.info.get(LEGACY_META_KEY)
-        return json.loads(raw) if raw else None
+            return meta_from_info(im.info)
     except (OSError, ValueError):
         return None
+
+
+def _aspect_for(size) -> str | None:
+    """記録されたサイズに一致するサイズ欄の選択肢。無ければ None。"""
+    if not size or len(size) != 2:
+        return None
+    for label, wh in ASPECTS.items():
+        if wh and list(wh) == list(size):
+            return label
+    return None
+
+
+# 復元で触る欄の数。prefix / prompt / negative / steps / cfg / sampler /
+# clip_skip / seed / aspect の 9 つと、LoRA の (名前, 強度) × MAX、注記 1 つ
+RESTORE_COUNT = 9 + lora.MAX * 2 + 1
+
+
+def restore_fields(meta):
+    """読み取った生成条件を、左の入力欄へ戻すための更新をまとめて作る。
+
+    履歴からの選択と、img2img への画像設置で同じものを使う。
+    条件が無い画像では 1 つも触らない（gr.skip）。既に打ちかけている
+    プロンプトを、素性の分からない画像で消してしまわないため。
+
+    プレフィックスを空にするのは、記録されている prompt が
+    「プレフィックス + プロンプト」を連結したあとの文字列だから。
+    そのまま prompt 欄へ入れると、生成時にプレフィックスが二重に付く。
+    記録どおりに作り直せることを優先している。
+    """
+    hold = (gr.skip(),) * RESTORE_COUNT
+    if not meta:
+        return hold
+
+    aspect = _aspect_for(meta.get("size"))
+    choices = lora_choices()
+    raw = [(n, w) for n, w in (meta.get("loras") or [])][:lora.MAX]
+    lora_outs = []
+    for i in range(lora.MAX):
+        if i < len(raw):
+            name, weight = raw[i]
+            # 手元に無い名前も選択肢に足して残す。消すと、元の絵に効いていた
+            # LoRA が抜けたことに気づけない（注記は on_lora_change が出す）
+            c = choices if name in choices else choices + [name]
+            lora_outs.append(gr.update(choices=c, value=name))
+            lora_outs.append(gr.update(value=lora.clamp(weight)))
+        else:
+            lora_outs.append(gr.update(choices=choices, value=LORA_NONE))
+            lora_outs.append(gr.update(value=lora.WEIGHT_DEFAULT))
+    note = on_lora_change(*[
+        x for i in range(lora.MAX)
+        for x in ((raw[i][0], raw[i][1]) if i < len(raw) else (LORA_NONE, 0))
+    ])
+    return (
+        "",                                   # プレフィックス（上のとおり空にする）
+        meta.get("prompt", ""),
+        meta.get("negative", ""),
+        meta.get("steps", 28),
+        meta.get("cfg", 5.0),
+        meta.get("sampler", "euler_a"),
+        meta.get("clip_skip", 2),
+        meta.get("seed", -1),
+        gr.update(value=aspect) if aspect else gr.skip(),
+        *lora_outs,
+        note,
+    )
 
 
 def _save_async(images, paths, params: dict | None = None):
@@ -683,9 +760,10 @@ def on_pick_history(evt: gr.SelectData):
     返す辞書は on_variations / on_upscale / on_favorite が受け取る形と同じなので、
     生成タブ用に書いたハンドラをそのまま使い回せる。
     """
+    hold = (gr.skip(),) * RESTORE_COUNT
     files = list_history()
     if evt.index is None or evt.index >= len(files):
-        return None, "選択できませんでした。再読み込みしてください。"
+        return None, "選択できませんでした。再読み込みしてください。", *hold
     path = Path(files[evt.index])
     meta = read_meta(path)
     try:
@@ -693,7 +771,7 @@ def on_pick_history(evt: gr.SelectData):
         img.load()
         img = img.convert("RGB")
     except OSError as e:
-        return None, f"画像を開けませんでした: {e}"
+        return None, f"画像を開けませんでした: {e}", *hold
 
     if meta is None:
         # 生成条件が無い画像（この機能より前に作られたもの、外部から置いたもの）。
@@ -704,10 +782,13 @@ def on_pick_history(evt: gr.SelectData):
             "sampler": "euler_a", "clip_skip": 2, "steps": 28,
             "size": list(img.size), "no_meta": True,
         }
-        return state, (
+        # 素性の分からない画像で、打ちかけの設定を消さないよう欄は触らない
+        return (
+            state,
             f"{path.name}  size: {img.width}x{img.height}\n"
             "生成条件が記録されていない画像です（この機能より前に作られたもの）。\n"
-            "お気に入りには入れられますが、少しだけ変える・解像度を上げるは実行できません。"
+            "お気に入りには入れられますが、少しだけ変える・解像度を上げるは実行できません。",
+            *hold,
         )
 
     state = {
@@ -720,14 +801,31 @@ def on_pick_history(evt: gr.SelectData):
     }
     size = meta.get("size") or list(img.size)
     # 生成直後に出る表示と語順を揃えておくと、見比べたときに読みやすい
-    return state, (
+    return (
+        state,
         f"seed: {meta.get('seed')}  size: {size[0]}x{size[1]}  "
         f"steps: {meta.get('steps')}  cfg: {meta.get('cfg')}  "
         f"{meta.get('sampler')}  clip skip: {meta.get('clip_skip')}\n"
         + (f"{_lora_text(state['loras'])}\n" if state["loras"] else "")
         + f"model: {meta.get('ckpt')}  file: {path.name}\n"
-        f"prompt: {meta.get('prompt', '')}"
+        + f"prompt: {meta.get('prompt', '')}",
+        *restore_fields(meta),
     )
+
+
+def on_image_meta(img):
+    """img2img に置かれた画像から生成条件を読み戻す。
+
+    履歴と同じ経路にしてある。自分で生成した絵をファイルから置き直したときに、
+    条件だけ失われるのを避けるため。
+    """
+    hold = (gr.skip(),) * RESTORE_COUNT
+    if img is None:
+        return (gr.skip(), *hold)
+    meta = meta_from_info(getattr(img, "info", None))
+    if not meta:
+        return (_note("この画像には生成条件が記録されていません（設定は変えません）"), *hold)
+    return (_note("画像に記録されていた生成条件を欄に戻しました"), *restore_fields(meta))
 
 
 def _need_meta(state):
@@ -1034,6 +1132,12 @@ with gr.Blocks(title="PuniGen") as demo:
     # 画面の並び (名前, 強度) × 3 をそのまま渡す。lora_items がここから畳む
     lora_inputs = [c for pair in zip(lora_dds, lora_sls) for c in pair]
 
+    # 画像から生成条件を戻す先。順番は restore_fields の戻り値と揃える
+    restore_outputs = (
+        [prefix, prompt, negative, steps, cfg, sampler, clip_skip, seed, aspect]
+        + lora_inputs + [lora_note]
+    )
+
     # 選ばれた LoRA が手元にあるか、選び直すたびに確かめて知らせる
     for _dd in lora_dds:
         _dd.change(on_lora_change, lora_inputs, lora_note)
@@ -1087,7 +1191,9 @@ with gr.Blocks(title="PuniGen") as demo:
     out_tabs.select(
         _on_out_tab, None, [hist_gallery, hist_sel, info, which_out],
     ).then(fav_button_state, *_fav_args)
-    hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
+    hist_gallery.select(
+        on_pick_history, None, [hist_sel, info] + restore_outputs,
+    ).then(
         fav_button_state, *_fav_args
     )
     hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
@@ -1123,6 +1229,10 @@ with gr.Blocks(title="PuniGen") as demo:
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
     ).then(fav_button_state, *_fav_args)
+
+    # img2img に置いた画像からも同じ経路で戻す。自分で生成した絵を
+    # ファイルから置き直したときに、条件だけ失われるのを避ける
+    in_image.upload(on_image_meta, in_image, [progress] + restore_outputs)
 
     fav_tab.select(on_refresh_favorites, None, fav_gallery)
     demo.load(on_refresh_favorites, None, fav_gallery)
