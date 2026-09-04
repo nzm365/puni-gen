@@ -55,7 +55,8 @@ terms of its own origin.
 
 2. Real-ESRGAN weights (downloaded at run time, not bundled)
    File: RealESRGAN_x4plus_anime_6B.pth
-   Fetched on first use of the upscaling feature from the Real-ESRGAN project
+   Fetched on first use of the upscaling feature, and verified against a pinned
+   SHA256 before being stored. It comes from the Real-ESRGAN project
    by Xintao Wang and contributors, which is distributed under the
    BSD-3-Clause License.
    https://github.com/xinntao/Real-ESRGAN
