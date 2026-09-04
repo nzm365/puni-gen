@@ -600,6 +600,84 @@ def _fav_button(state, idx):
     )
 
 
+# ---------- 削除（ゴミ箱へ移動）----------
+# 消したものの置き場。outputs/ の中に置くのは、生成物の在り処を 1 つに保つため。
+# list_history() は outputs/ の直下しか見ないので、ここへ移せば履歴から消える。
+TRASH_DIR = OUT_DIR / ".trash"
+
+
+def _to_trash(path: Path) -> Path:
+    """1 枚をゴミ箱へ移し、移した先を返す。
+
+    unlink せず移動にするのは、押し間違いから戻せるようにするため。お気に入りの
+    解除が favorites から outputs へ「戻す」操作なのと同じ考え方で、消す操作も
+    取り返しがつく形にしてある。ゴミ箱の整理は自動ではやらない。
+    """
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    dest = TRASH_DIR / path.name
+    if dest.exists():
+        # 手でゴミ箱から戻したものを、また消したとき。上書きすると先に消した方が
+        # 失われて戻せなくなるので、名前をずらして両方残す
+        dest = TRASH_DIR / f"{path.stem}_{datetime.now():%H%M%S}{path.suffix}"
+    shutil.move(str(path), str(dest))
+    return dest
+
+
+def _forget_cached(name: str) -> None:
+    """消した画像を含む結果キャッシュを捨てる。
+
+    同一設定・同一 seed の再実行はキャッシュを返すだけで保存し直さない。
+    消したあとに同じ条件で生成すると、画面には出るのにファイルが無い、という
+    食い違いが起きてしまう。もう一度計算させれば、ちゃんと保存される。
+    """
+    for key in [
+        k for k, v in RESULT_CACHE.items()
+        if any(Path(p).name == name for p in (v[2] or {}).get("paths", []))
+    ]:
+        del RESULT_CACHE[key]
+
+
+def on_delete(which, last, picked, hist_sel):
+    """選択中の画像をゴミ箱へ移す。
+
+    お気に入りに入っている画像は断る。お気に入りは残すために選り分けた場所で、
+    履歴を片づけるためのボタンで消えてしまうと具合が悪い。★ で解除してもらう。
+
+    「今回の結果」から消したときは、画面のギャラリーからも取り除く。ファイルだけ
+    消えて絵が残っていると、消えたのかどうか分からない。
+    """
+    state = hist_sel if which == "history" else last
+    idx = 0 if which == "history" else picked
+    name = _fav_name(state, idx)
+    if not name:
+        where = "履歴から画像を選んでください。" if which == "history" else "先に画像を生成してください。"
+        return where, gr.skip(), gr.skip(), gr.skip()
+
+    if (FAV_DIR / name).exists():
+        return ("お気に入りに入っている画像は消せません。"
+                "★ を押して解除してから、もう一度お試しください。"), gr.skip(), gr.skip(), gr.skip()
+
+    src = OUT_DIR / name
+    if not src.exists():
+        # 既に消えている（別の窓から消した、手で片づけた）。一覧の更新だけで足りる
+        return "この画像は見つかりませんでした（すでに消えているようです）。", gr.skip(), gr.skip(), gr.skip()
+
+    _to_trash(src)
+    _forget_cached(name)
+    msg = f"{name} をゴミ箱 (outputs/.trash/) へ移しました。戻したいときはフォルダから出してください。"
+
+    if which == "history":
+        # 履歴側は .then(_refresh_hist) が貼り替える。こちらは触らない
+        return msg, gr.skip(), gr.skip(), gr.skip()
+
+    # 「今回の結果」から消した分を、表示と持ち回している状態の両方から抜く
+    i = 0 if picked is None else min(int(picked), len(last["paths"]) - 1)
+    rest = dict(last)
+    for key in ("images", "paths", "seeds"):
+        rest[key] = [x for j, x in enumerate(last.get(key, [])) if j != i]
+    return msg, gr.update(value=rest["images"]), rest, None
+
+
 def list_favorites():
     """お気に入りフォルダの画像を新しい順で返す。"""
     if not FAV_DIR.exists():
@@ -731,7 +809,11 @@ def on_variations(last, idx):
 
 # ---------- 生成履歴 ----------
 def list_history():
-    """outputs/ の画像を新しい順に返す。"""
+    """outputs/ の画像を新しい順に返す。
+
+    glob は再帰しないので、ゴミ箱 (outputs/.trash/) の中身はここに出てこない。
+    rglob に変えるとゴミ箱ごと履歴に並んでしまうので、そのままにしておく。
+    """
     if not OUT_DIR.exists():
         return []
     files = sorted(OUT_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -860,8 +942,8 @@ def begin_job(which, last, picked, hist_sel):
     """押された時点で対象を確定し、先に「今回の結果」へ切り替える。
 
     切り替えはチェーンの最後にあったため、履歴から押すと生成が終わるまで
-    履歴を見たままだった。進捗バーも途中プレビューも右カラムに出るので、
-    待っている間こそそちらを見せたい。だから押した直後に移す。
+    履歴を見たままだった。進捗バーは右カラムに出るので、待っている間こそ
+    そちらを見せたい。だから押した直後に移す。
 
     対象をここで確定して State に持たせるのは、切り替えに伴って which_out が
     current になっても、履歴で選んだ画像を見失わないようにするため。
@@ -1041,9 +1123,16 @@ with gr.Blocks(title="PuniGen") as demo:
                         hires = gr.Button(
                             f"解像度を {upscaler.SCALE:g} 倍", variant="secondary", scale=3
                         )
+                        # 消すといっても実体はゴミ箱への移動なので、赤 (stop) にはしない。
+                        # 中止と同じ強さで出すと、取り返しがつかない操作に見えてしまう
+                        # 伸ばさず、文字がちょうど収まる幅で置く。Gradio の既定
+                        # (min_width=160) のままだと 3 つのボタンが幅を等分し、
+                        # 「少しだけ変える（2 枚）」が折り返してしまう（実測 187px 必要）
+                        delete = gr.Button("削除", variant="secondary", scale=0, min_width=64)
                         # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
+                        # 星だけのボタンなので伸ばさない。余った幅は左の 2 つに渡す
                         favorite = gr.Button(
-                            "", variant="secondary", scale=1,
+                            "", variant="secondary", scale=0,
                             elem_classes=FAV_CLASS,
                         )
                     info = gr.Textbox(label="生成情報", interactive=False, lines=3,
@@ -1224,6 +1313,14 @@ with gr.Blocks(title="PuniGen") as demo:
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
     ).then(fav_button_state, *_fav_args)
+
+    # 削除はお気に入りと違って一覧から画像が減るので、履歴も貼り替える。
+    # 貼り替えると選択中の番号が別の画像を指してしまうため、
+    # on_refresh_history が選択を外してから星の状態を取り直す。
+    delete.click(
+        on_delete, [which_out, last_gen, picked, hist_sel],
+        [info, gallery, last_gen, picked],
+    ).then(*_refresh_hist).then(fav_button_state, *_fav_args)
 
     # img2img に置いた画像からも同じ経路で戻す。自分で生成した絵を
     # ファイルから置き直したときに、条件だけ失われるのを避ける
