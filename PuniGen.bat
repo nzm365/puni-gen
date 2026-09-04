@@ -12,6 +12,16 @@ cd /d "%~dp0"
 set "FIRST="
 set "SKIPDEPS="
 
+rem 起動したことが一目で分かるように名乗る。( ) \ / は echo にそのまま置ける
+rem （cmd が特別扱いするのは % ^ & | < > で、この絵には含まれない）。
+echo  ____  _  _  __ _  __  ___  ____  __ _ 
+echo (  _ \/ )( \(  ( \(  )/ __)(  __)(  ( \
+echo  ) __/) \/ (/    / )(( (_ \ ) _) /    /
+echo (__)  \____/\_)__)(__)\___/(____)\_)__)
+echo.
+echo   Puni Uses No Intricacy.
+echo.
+
 echo [1/4] uv を確認...
 where uv >nul 2>nul
 if not errorlevel 1 goto :uv_ok
