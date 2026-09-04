@@ -237,10 +237,11 @@ gradio-app {
    ラベルは空にしてあり、星はここで背景画像として描く。
    未登録は輪郭だけのグレー、登録済みは塗りつぶしの黄色。 */
 .gradio-container button.fav-btn {
-    background-image: url("data:image/svg+xml,__STAR_OFF__");
-    /* 登録済みのときは variant="primary" が付く。Gradio の .primary は background を
-       一括指定で当てるので、repeat / position / size が初期値に戻され、星が
-       ボタン一面に敷き詰められる（実際にそうなっていた）。ここは譲らない */
+    /* 登録済みのときの variant="primary" も、触れたときの :hover も、Gradio は
+       background の一括指定で当ててくる。指定されると絵そのものが none に
+       戻って消え、repeat / position / size も初期値に戻って絵が一面に
+       敷き詰められる（どちらも実際にそうなっていた）。ここは全部譲らない */
+    background-image: url("data:image/svg+xml,__STAR_OFF__") !important;
     background-repeat: no-repeat !important;
     background-position: center !important;
     background-size: 20px 20px !important;
@@ -257,22 +258,15 @@ gradio-app {
     height: 24px;
 }
 .gradio-container button.fav-btn.on {
-    background-image: url("data:image/svg+xml,__STAR_ON__");
+    background-image: url("data:image/svg+xml,__STAR_ON__") !important;
 }
 
-/* 押せることが分かるよう、触れたときだけ少しだけ大きくする */
-.gradio-container button.fav-btn:hover {
-    background-size: 22px 22px !important;
-}
-@media (prefers-reduced-motion: reduce) {
-    .gradio-container button.fav-btn:hover { background-size: 20px 20px !important; }
-}
 
 /* ---- 削除ボタンのゴミ箱 ----
    星と同じ作り。ラベルの「削除」は下の指定で見えなくしてあるが、消してはいない。
    読み上げソフトに押せるものの名前が残り、CSS が届かない環境では文字が出る。 */
 .gradio-container button.del-btn {
-    background-image: url("data:image/svg+xml,__TRASH__");
+    background-image: url("data:image/svg+xml,__TRASH__") !important;
     background-repeat: no-repeat !important;
     background-position: center !important;
     background-size: 19px 19px !important;
@@ -288,14 +282,45 @@ gradio-app {
     height: 24px;
 }
 
-/* 触れたときだけ赤くする。常に赤いと、取り返しのつく操作にしては強すぎる
-   （実体は outputs/.trash/ への移動で、フォルダから出せば戻る） */
-.gradio-container button.del-btn:hover {
-    background-image: url("data:image/svg+xml,__TRASH_HOVER__");
-    background-size: 21px 21px !important;
+/* ---- 絵のボタンに触れたとき ----
+   絵ではなくボタンの地色を変える。絵は 20px 前後と小さく、そこだけ色を変えても
+   変化に気づきにくいため。面で変えた方が、どのボタンの上にいるか一目で分かる。
+
+   色は地色を置き換えるのではなく、ボタンの地色の上に半透明の面を 1 枚重ねる。
+   background-color を差し替えると、ボタンが持っていた不透明な地色ごと消えて
+   下の画面が透け、明るくなるはずのホバーが逆に暗く沈んで見えた。
+   絵はその面より上に置くので、色を重ねても絵は隠れない。
+
+   お気に入り済みのときは variant="primary" が付き、Gradio の .primary は
+   background を一括指定で当ててくる。ここも !important で譲らない
+   （星の背景画像を守っているのと同じ事情）。
+
+   赤も黄も常時ではなく触れたときだけにしている。ゴミ箱の実体は
+   outputs/.trash/ への移動で、フォルダから出せば戻せる。常に赤い面を置くと、
+   取り返しがつかない操作に見えてしまう。 */
+.gradio-container button.fav-btn:hover {
+    background-image:
+        url("data:image/svg+xml,__STAR_OFF__"),
+        linear-gradient(__FAV_TINT__, __FAV_TINT__) !important;
+    background-repeat: no-repeat, no-repeat !important;
+    background-position: center, center !important;
+    background-size: 20px 20px, 100% 100% !important;
 }
-@media (prefers-reduced-motion: reduce) {
-    .gradio-container button.del-btn:hover { background-size: 19px 19px !important; }
+/* 登録済みのときは、ボタンがもう黄色く塗られている。そこへ同じ黄色を重ねても
+   色が濁るだけでほとんど変わらなかった（実測で差 45、しかも彩度が落ちる方向）。
+   塗りつぶしのボタンは暗くするのが分かりやすいので、こちらだけ黒を重ねる。 */
+.gradio-container button.fav-btn.on:hover {
+    background-image:
+        url("data:image/svg+xml,__STAR_ON__"),
+        linear-gradient(__FAV_ON_TINT__, __FAV_ON_TINT__) !important;
+}
+.gradio-container button.del-btn:hover {
+    background-image:
+        url("data:image/svg+xml,__TRASH__"),
+        linear-gradient(__DEL_TINT__, __DEL_TINT__) !important;
+    background-repeat: no-repeat, no-repeat !important;
+    background-position: center, center !important;
+    background-size: 19px 19px, 100% 100% !important;
 }
 """
 
@@ -306,6 +331,8 @@ def build_css() -> str:
         .replace("__BTN_H__", REFRESH_BTN_HEIGHT)
         .replace("__STAR_OFF__", _star("none", "%23a1a1aa"))
         .replace("__STAR_ON__", _star("%23fbbf24", "%23f59e0b"))
-        .replace("__TRASH_HOVER__", _trash("%23ef4444"))
+        .replace("__FAV_TINT__", "rgba(251, 191, 36, 0.30)")
+        .replace("__FAV_ON_TINT__", "rgba(0, 0, 0, 0.22)")
+        .replace("__DEL_TINT__", "rgba(239, 68, 68, 0.30)")
         .replace("__TRASH__", _trash("%23a1a1aa"))
     )
