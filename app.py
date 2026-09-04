@@ -325,6 +325,35 @@ def _aspect_for(size) -> str | None:
 RESTORE_COUNT = 9 + lora.MAX * 2 + 1
 
 
+def split_prefix(meta) -> tuple[str, str]:
+    """記録された prompt を、プレフィックス欄とプロンプト欄に分け直す。
+
+    生成時は (プレフィックス + プロンプト) を連結して 1 本の文字列として
+    記録している。そのまま prompt 欄へ入れるとプレフィックスが二重に付くが、
+    かといってプレフィックス欄を空のままにすると、画面がその絵の作り方を
+    表さない。そこで、その絵を作ったモデルのプリセットからプレフィックスを
+    引き、前方一致したぶんだけプレフィックス欄へ戻す。
+
+    引くのは「いま選ばれているモデル」ではなく「その絵を作ったモデル」の
+    プリセット。実際に連結されたのはそちらだから。
+
+    前方一致しないとき（プリセットを変えた、生成時に手で消した、など）は
+    プレフィックスを空にして全部を prompt 欄へ入れる。連結した結果はどちらでも
+    同じなので、記録どおりに作り直せることは変わらない。
+    """
+    full = meta.get("prompt", "")
+    ckpt = meta.get("ckpt")
+    if not ckpt:
+        return "", full
+    try:
+        prefix = load_preset(ckpt)["prefix_pos"] or ""
+    except (OSError, ValueError, KeyError):
+        return "", full   # プリセットが読めなくても復元自体は続ける
+    if prefix and full.startswith(prefix):
+        return prefix, full[len(prefix):]
+    return "", full
+
+
 def restore_fields(meta):
     """読み取った生成条件を、左の入力欄へ戻すための更新をまとめて作る。
 
@@ -332,10 +361,7 @@ def restore_fields(meta):
     条件が無い画像では 1 つも触らない（gr.skip）。既に打ちかけている
     プロンプトを、素性の分からない画像で消してしまわないため。
 
-    プレフィックスを空にするのは、記録されている prompt が
-    「プレフィックス + プロンプト」を連結したあとの文字列だから。
-    そのまま prompt 欄へ入れると、生成時にプレフィックスが二重に付く。
-    記録どおりに作り直せることを優先している。
+    プレフィックスとプロンプトの分け方は split_prefix を参照。
     """
     hold = (gr.skip(),) * RESTORE_COUNT
     if not meta:
@@ -360,9 +386,10 @@ def restore_fields(meta):
         x for i in range(lora.MAX)
         for x in ((raw[i][0], raw[i][1]) if i < len(raw) else (LORA_NONE, 0))
     ])
+    prefix_val, prompt_val = split_prefix(meta)
     return (
-        "",                                   # プレフィックス（上のとおり空にする）
-        meta.get("prompt", ""),
+        prefix_val,
+        prompt_val,
         meta.get("negative", ""),
         meta.get("steps", 28),
         meta.get("cfg", 5.0),
