@@ -61,7 +61,7 @@ terms of its own origin.
    https://github.com/xinntao/Real-ESRGAN
 
 3. Python packages (installed at run time, not bundled)
-   Installed by setup.bat from requirements.lock. Each package keeps its own
+   Installed by PuniGen.bat from requirements.lock. Each package keeps its own
    license; none of them are redistributed as part of this repository.
 
 4. Checkpoints, LoRA and embeddings (supplied by the user)

@@ -1,12 +1,12 @@
 # 直接依存だけを書く「入力」ファイル。
-# ここを編集したら setup.bat の隣にある手順でロックを作り直す:
+# ここを編集したら README の「依存パッケージを更新する」の手順でロックを作り直す:
 #
 #   uv pip compile requirements.in -o requirements.lock ^
 #     --index-strategy unsafe-best-match ^
 #     --extra-index-url https://download.pytorch.org/whl/cu128
 #
 # 実際にインストールされるのは requirements.lock の方で、そちらは推移的依存まで
-# すべてバージョンが固定されている。いつ・どの環境で setup.bat を実行しても
+# すべてバージョンが固定されている。いつ・どの環境で PuniGen.bat を実行しても
 # 同じ構成になるようにするため。
 
 # RTX 40 / 50 系に必要な CUDA 12.8 ビルド。別インデックスから入る。
@@ -35,5 +35,5 @@ spandrel==0.4.2
 # プロンプトの重み付き構文と 77 トークン超の解釈。
 # compel 本体は notebook (Jupyter 一式) を依存に宣言しているが実行時には読まない。
 # ロックに Jupyter 一式を持ち込みたくないので、ここには pyparsing だけを書き、
-# compel 本体は setup.bat が --no-deps で入れる
+# compel 本体は PuniGen.bat が --no-deps で入れる
 pyparsing==3.3.2

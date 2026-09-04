@@ -503,7 +503,7 @@ class Engine:
         """
         if not torch.cuda.is_available():
             raise InsufficientVram(
-                "CUDA が使える GPU が見つかりません。setup.bat を実行し直してください。"
+                "CUDA が使える GPU が見つかりません。PuniGen.bat を実行し直してください。"
             )
         # 総容量ではなく「今の空き」で判定する。他のアプリ (ゲーム・録画・dwm) が
         # VRAM を掴んでいると、総容量では載る計算でも実際には共有メモリに溢れて
