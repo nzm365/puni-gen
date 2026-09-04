@@ -10,11 +10,11 @@
    zoom は仕様上は非標準だが Chrome / Edge / Firefox いずれも対応しており、
    ローカルのブラウザで開く前提のツールなので実用上の問題はない。
 
-2. お気に入りボタンの星を描く
-   フォントの ★ は字形が環境ごとに変わって見栄えがしない。
+2. お気に入りの星と削除のゴミ箱を描く
+   フォントの ★ や 🗑 は字形が環境ごとに変わって見栄えがしない。
    Gradio のボタンはラベルの HTML をエスケープするので SVG を直接は埋め込めない
    （試したところ、タグがそのまま文字として表示された）。
-   そこで app.py 側は状態をクラス名で伝えるだけにし、星はここで背景画像として描く。
+   そこで app.py 側は状態をクラス名で伝えるだけにし、絵はここで背景画像として描く。
 
 3. 進捗バーを描く
    待ちには 2 種類ある。step 数のように残りが数えられるものは、実際の割合まで
@@ -51,16 +51,32 @@ _STAR_PATH = (
 )
 
 
-def _star(fill: str, stroke: str) -> str:
+# ゴミ箱。ふた・本体・中の 2 本線を 1 本の path にまとめてある
+_TRASH_PATH = (
+    "M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4"
+    "a2 2 0 0 1 2 2v2M10 11v6M14 11v6"
+)
+
+
+def _svg(path: str, fill: str, stroke: str, width: str = "1.7") -> str:
     """data URI に埋め込める形の SVG を作る。fill を変えて塗り／輪郭を作り分ける。"""
     svg = (
         "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' "
-        f"fill='{fill}' stroke='{stroke}' stroke-width='1.7' "
+        f"fill='{fill}' stroke='{stroke}' stroke-width='{width}' "
         "stroke-linejoin='round' stroke-linecap='round'>"
-        f"<path d='{_STAR_PATH}'/></svg>"
+        f"<path d='{path}'/></svg>"
     )
     # URL に置けない文字だけ最小限を置き換える
     return svg.replace("<", "%3C").replace(">", "%3E").replace("#", "%23")
+
+
+def _star(fill: str, stroke: str) -> str:
+    return _svg(_STAR_PATH, fill, stroke)
+
+
+def _trash(stroke: str) -> str:
+    # 塗らない。星の未登録と同じ「輪郭だけ」の見え方に揃える
+    return _svg(_TRASH_PATH, "none", stroke, "1.8")
 
 
 CSS = """
@@ -221,10 +237,11 @@ gradio-app {
    ラベルは空にしてあり、星はここで背景画像として描く。
    未登録は輪郭だけのグレー、登録済みは塗りつぶしの黄色。 */
 .gradio-container button.fav-btn {
-    background-image: url("data:image/svg+xml,__STAR_OFF__");
-    /* 登録済みのときは variant="primary" が付く。Gradio の .primary は background を
-       一括指定で当てるので、repeat / position / size が初期値に戻され、星が
-       ボタン一面に敷き詰められる（実際にそうなっていた）。ここは譲らない */
+    /* 登録済みのときの variant="primary" も、触れたときの :hover も、Gradio は
+       background の一括指定で当ててくる。指定されると絵そのものが none に
+       戻って消え、repeat / position / size も初期値に戻って絵が一面に
+       敷き詰められる（どちらも実際にそうなっていた）。ここは全部譲らない */
+    background-image: url("data:image/svg+xml,__STAR_OFF__") !important;
     background-repeat: no-repeat !important;
     background-position: center !important;
     background-size: 20px 20px !important;
@@ -241,15 +258,69 @@ gradio-app {
     height: 24px;
 }
 .gradio-container button.fav-btn.on {
-    background-image: url("data:image/svg+xml,__STAR_ON__");
+    background-image: url("data:image/svg+xml,__STAR_ON__") !important;
 }
 
-/* 押せることが分かるよう、触れたときだけ少しだけ大きくする */
-.gradio-container button.fav-btn:hover {
-    background-size: 22px 22px !important;
+
+/* ---- 削除ボタンのゴミ箱 ----
+   星と同じ作り。ラベルの「削除」は下の指定で見えなくしてあるが、消してはいない。
+   読み上げソフトに押せるものの名前が残り、CSS が届かない環境では文字が出る。 */
+.gradio-container button.del-btn {
+    background-image: url("data:image/svg+xml,__TRASH__") !important;
+    background-repeat: no-repeat !important;
+    background-position: center !important;
+    background-size: 19px 19px !important;
+    min-width: 46px;
+    /* 文字は消さず、見えなくするだけ。幅も食わないよう 0 にする */
+    font-size: 0;
+    color: transparent;
 }
-@media (prefers-reduced-motion: reduce) {
-    .gradio-container button.fav-btn:hover { background-size: 20px 20px !important; }
+.gradio-container button.del-btn::before {
+    content: "";
+    display: block;
+    /* 文字ありのボタンと同じ 36px の高さにする（星と同じ理由） */
+    height: 24px;
+}
+
+/* ---- 絵のボタンに触れたとき ----
+   絵ではなくボタンの地色を変える。絵は 20px 前後と小さく、そこだけ色を変えても
+   変化に気づきにくいため。面で変えた方が、どのボタンの上にいるか一目で分かる。
+
+   色は地色を置き換えるのではなく、ボタンの地色の上に半透明の面を 1 枚重ねる。
+   background-color を差し替えると、ボタンが持っていた不透明な地色ごと消えて
+   下の画面が透け、明るくなるはずのホバーが逆に暗く沈んで見えた。
+   絵はその面より上に置くので、色を重ねても絵は隠れない。
+
+   お気に入り済みのときは variant="primary" が付き、Gradio の .primary は
+   background を一括指定で当ててくる。ここも !important で譲らない
+   （星の背景画像を守っているのと同じ事情）。
+
+   赤も黄も常時ではなく触れたときだけにしている。ゴミ箱の実体は
+   outputs/.trash/ への移動で、フォルダから出せば戻せる。常に赤い面を置くと、
+   取り返しがつかない操作に見えてしまう。 */
+.gradio-container button.fav-btn:hover {
+    background-image:
+        url("data:image/svg+xml,__STAR_OFF__"),
+        linear-gradient(__FAV_TINT__, __FAV_TINT__) !important;
+    background-repeat: no-repeat, no-repeat !important;
+    background-position: center, center !important;
+    background-size: 20px 20px, 100% 100% !important;
+}
+/* 登録済みのときは、ボタンがもう黄色く塗られている。そこへ同じ黄色を重ねても
+   色が濁るだけでほとんど変わらなかった（実測で差 45、しかも彩度が落ちる方向）。
+   塗りつぶしのボタンは暗くするのが分かりやすいので、こちらだけ黒を重ねる。 */
+.gradio-container button.fav-btn.on:hover {
+    background-image:
+        url("data:image/svg+xml,__STAR_ON__"),
+        linear-gradient(__FAV_ON_TINT__, __FAV_ON_TINT__) !important;
+}
+.gradio-container button.del-btn:hover {
+    background-image:
+        url("data:image/svg+xml,__TRASH__"),
+        linear-gradient(__DEL_TINT__, __DEL_TINT__) !important;
+    background-repeat: no-repeat, no-repeat !important;
+    background-position: center, center !important;
+    background-size: 19px 19px, 100% 100% !important;
 }
 """
 
@@ -260,4 +331,8 @@ def build_css() -> str:
         .replace("__BTN_H__", REFRESH_BTN_HEIGHT)
         .replace("__STAR_OFF__", _star("none", "%23a1a1aa"))
         .replace("__STAR_ON__", _star("%23fbbf24", "%23f59e0b"))
+        .replace("__FAV_TINT__", "rgba(251, 191, 36, 0.30)")
+        .replace("__FAV_ON_TINT__", "rgba(0, 0, 0, 0.22)")
+        .replace("__DEL_TINT__", "rgba(239, 68, 68, 0.30)")
+        .replace("__TRASH__", _trash("%23a1a1aa"))
     )

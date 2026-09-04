@@ -53,9 +53,6 @@ USE_CHANNELS_LAST = True    # Tensor Core が効きやすいメモリ配置。�
 USE_CUDNN_BENCHMARK = True  # 解像度が数種類に固定される本ツールと好相性。初回のみカーネル探索
 USE_FUSE_QKV = False        # +約1.2GB。12GB では VRAM が溢れて逆効果 (上記実測)。16GB 以上専用
 
-# 何ステップごとに途中プレビューを出すか
-PREVIEW_EVERY = 3
-
 # ---------- 高解像度化 (Hires.fix) ----------
 # 生成済み画像を拡大してから img2img で描き直し、細部を足す。
 HIRES_SCALE = 1.5          # 倍率。832x1216 -> 1248x1824 (画素数 2.25 倍)
@@ -74,15 +71,6 @@ ATTENTION_SLICING_PIXELS = 2000 * 1000
 # 元のノイズと別 seed のノイズを球面補間で混ぜる。0 で完全に同じ絵、1 で無関係な絵。
 VARIATION_STRENGTH = 0.15  # 「もう少し違うのが欲しい」に合う程度の振れ幅
 VARIATION_COUNT = 2        # 一度に出す枚数
-
-# latent → RGB の線形近似係数 (ComfyUI が SDXL プレビューに使っているもの)。
-# TAESDXL が使えない環境向けの、依存ゼロ・ほぼゼロコストのフォールバック
-_LATENT_RGB = torch.tensor([
-    [ 0.3920,  0.4054,  0.4549],
-    [-0.2634, -0.0196,  0.0653],
-    [ 0.0568,  0.1687, -0.0755],
-    [-0.3112, -0.2359, -0.2076],
-])
 
 # 単一ファイル形式のチェックポイントで UNet が持つキーの接頭辞。
 # オフロード時は「一番大きい単体モジュール = UNet」が VRAM ピークになる。
@@ -277,8 +265,6 @@ class Engine:
         # 「予測ではなく実測で」タイル分割が要ると分かったときだけ立てる。
         # 立っている間は毎回の判定を飛ばし、モデルを入れ替えるまで戻さない
         self._vae_force_tiling = False
-        self._taesd = None  # AutoencoderTiny | "unavailable" | None (未初期化)
-        self._taesd_started = False
         if torch.cuda.is_available():
             if USE_CUDNN_BENCHMARK:
                 torch.backends.cudnn.benchmark = True
@@ -362,9 +348,6 @@ class Engine:
         self._offload = offload
         self._vae_force_tiling = False  # 前のモデルで得た実測の記憶は持ち越さない
         self.current = ckpt_name
-        if not self._taesd_started:  # プレビュー用の軽量 VAE を裏で用意しておく
-            self._taesd_started = True
-            threading.Thread(target=self._init_taesd, daemon=True).start()
         return (
             f"loaded: {ckpt_name}  ({mode})  "
             f"embeddings: {', '.join(self.loaded_embeddings) or 'none'}"
@@ -520,7 +503,7 @@ class Engine:
         """
         if not torch.cuda.is_available():
             raise InsufficientVram(
-                "CUDA が使える GPU が見つかりません。setup.bat を実行し直してください。"
+                "CUDA が使える GPU が見つかりません。PuniGen.bat を実行し直してください。"
             )
         # 総容量ではなく「今の空き」で判定する。他のアプリ (ゲーム・録画・dwm) が
         # VRAM を掴んでいると、総容量では載る計算でも実際には共有メモリに溢れて
@@ -820,42 +803,6 @@ class Engine:
         # どうせ次の生成でまた bf16 が必要になる。サイズは fp16 と同じで常駐コストもない
         return pils
 
-    # ---------- 途中プレビュー ----------
-    def _init_taesd(self):
-        """プレビュー用の軽量 VAE (TAESDXL, 約10MB) を裏で取得する。
-
-        初回のみ Hugging Face から落とす。オフライン等で取得できなければ
-        線形近似プレビュー (_LATENT_RGB) に自動で落ちる。生成には影響しない。
-        """
-        try:
-            from diffusers import AutoencoderTiny
-            dec = AutoencoderTiny.from_pretrained("madebyollin/taesdxl", torch_dtype=torch.float16)
-            self._taesd = dec.to("cuda")
-            print("[preview] TAESDXL を読み込みました（高精細プレビュー）")
-        except Exception as e:  # noqa: BLE001
-            self._taesd = "unavailable"
-            print(f"[preview] TAESDXL が使えないため簡易プレビューで動きます: {e}")
-
-    def _preview_images(self, latents: torch.Tensor, size: tuple[int, int]) -> list[Image.Image]:
-        """現在の latent から途中経過の画像を作る。数 ms 級で、本生成の品質には無関係。"""
-        w, h = max(size[0] // 2, 8), max(size[1] // 2, 8)  # プレビューは半分の解像度で十分
-        dec = self._taesd
-        if dec is not None and not isinstance(dec, str):
-            # latent を 1/2 に縮めてからデコードする。出力がちょうど半分解像度になるので
-            # 後段のリサイズが不要になり、デコードと PIL 変換のコストも 1/4 で済む
-            # (プレビューは denoise ループ内で走るため、ここの重さがそのまま生成時間に乗る)
-            small = torch.nn.functional.avg_pool2d(latents.to(dec.dtype), 2)
-            img = dec.decode(small).sample
-            pils = self.pipe.image_processor.postprocess(img.float(), output_type="pil")
-            return [im if im.size == (w, h) else im.resize((w, h), Image.BILINEAR) for im in pils]
-        m = _LATENT_RGB.to(latents.device, latents.dtype)
-        rgb = torch.einsum("nchw,cr->nrhw", latents, m)
-        rgb = ((rgb + 1) / 2).clamp(0, 1).mul(255).round().byte().cpu()
-        return [
-            Image.fromarray(t.permute(1, 2, 0).numpy()).resize((w, h), Image.BILINEAR)
-            for t in rgb
-        ]
-
     # ---------- 計測 ----------
     @staticmethod
     @contextlib.contextmanager
@@ -902,7 +849,7 @@ class Engine:
     def upscale(self, image, prompt: str, negative: str, cfg: float, sampler: str,
                 clip_skip: int, seed: int, scale: float = HIRES_SCALE,
                 strength: float = HIRES_STRENGTH, steps: int = HIRES_STEPS,
-                preview_cb=None):
+                step_cb=None):
         """生成済み画像を拡大し、img2img で細部を描き足す。
 
         返り値は generate と同じ (images | None, seed, 計測行)。
@@ -913,7 +860,7 @@ class Engine:
         h = max(8, int(image.height * scale) // 8 * 8)
         return self.generate(
             prompt, negative, w, h, steps, cfg, sampler, clip_skip, seed, 1,
-            image=image, strength=strength, preview_cb=preview_cb,
+            image=image, strength=strength, step_cb=step_cb,
         )
 
     # ---------- 変分 (この絵を少しだけ変える) ----------
@@ -967,13 +914,13 @@ class Engine:
     def variations(self, prompt: str, negative: str, width: int, height: int, steps: int,
                    cfg: float, sampler: str, clip_skip: int, seed: int,
                    count: int = VARIATION_COUNT, strength: float = VARIATION_STRENGTH,
-                   preview_cb=None, on_phase=None):
+                   step_cb=None, on_phase=None):
         """気に入った絵の seed を固定したまま、少しだけ違う絵を count 枚出す。"""
         assert self.pipe is not None, "model not loaded"
         lat = self.variation_latents(seed, width, height, count, strength)
         return self.generate(
             prompt, negative, width, height, steps, cfg, sampler, clip_skip, seed, count,
-            preview_cb=preview_cb, init_latents=lat, on_phase=on_phase,
+            step_cb=step_cb, init_latents=lat, on_phase=on_phase,
         )
 
     # ---------- 生成 ----------
@@ -1015,7 +962,7 @@ class Engine:
         n: int = 1,
         image=None,
         strength: float = 0.6,
-        preview_cb=None,
+        step_cb=None,
         init_latents=None,
         on_phase=None,
     ):
@@ -1038,34 +985,13 @@ class Engine:
         # i2i の実効 step 数は steps × strength (diffusers の仕様)
         total = steps if image is None else max(1, int(steps * strength))
 
-        # プレビュー生成 (TAESD デコード + PIL 変換で計 0.6 秒級) を denoise ループから
-        # 追い出すための状態。latent だけ複製して別スレッドに渡し、GPU の本計算を止めない。
-        # 前のプレビューが作成中なら今回はスキップする (busy フラグ)
-        pv_busy = threading.Event()
-
-        def make_preview(done, snap):
-            try:
-                # snap は inference_mode 下で作られたテンソルなので、
-                # 別スレッド側も inference_mode に入っていないと演算が例外になる
-                with torch.inference_mode():
-                    pv = self._preview_images(snap, (width, height))
-            except Exception:  # noqa: BLE001 — プレビュー失敗で生成を殺さない
-                pv = None
-            finally:
-                pv_busy.clear()
-            if pv is not None:
-                preview_cb(done, total, pv)
-
         def cb(pipe, i, t, kw):
+            # 毎 step 呼ばれる。中止の判定と、進捗バーへの step 数の通知だけを行う。
+            # ここは denoise ループの中なので、重い処理を足すとそのまま生成時間に乗る
             if self.cancel.is_set():
                 pipe._interrupt = True  # 残りのループを空回りさせて即座に抜ける
-            elif preview_cb is not None:
-                done = i + 1
-                if done % PREVIEW_EVERY == 0 and done < total and not pv_busy.is_set():
-                    pv_busy.set()
-                    snap = kw["latents"].detach().clone()  # 数 MB。以後ループとは独立
-                    threading.Thread(target=make_preview, args=(done, snap), daemon=True).start()
-                preview_cb(done, total, None)  # step 数の表示は毎 step 更新する
+            elif step_cb is not None:
+                step_cb(i + 1, total)
             return {}
 
         common = dict(

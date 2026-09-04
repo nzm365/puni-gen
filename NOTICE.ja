@@ -51,12 +51,13 @@ AI 生成ツールとしての追加の免責事項
 
 2. Real-ESRGAN の重み（実行時に取得。同梱ではありません）
    ファイル: RealESRGAN_x4plus_anime_6B.pth
-   拡大機能を初めて使うときに取得します。Xintao Wang 氏らによる Real-ESRGAN
+   拡大機能を初めて使うときに取得し、固定した SHA256 と照合してから置きます。
+   Xintao Wang 氏らによる Real-ESRGAN
    プロジェクトのもので、BSD-3-Clause ライセンスで配布されています。
    https://github.com/xinntao/Real-ESRGAN
 
 3. Python のパッケージ（実行時に導入。同梱ではありません）
-   setup.bat が requirements.lock から導入します。それぞれが自分のライセンスを
+   PuniGen.bat が requirements.lock から導入します。それぞれが自分のライセンスを
    持っており、このリポジトリが再配布しているものはありません。
 
 4. チェックポイント / LoRA / embedding（利用者が用意するもの）

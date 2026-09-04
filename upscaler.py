@@ -10,6 +10,7 @@ models/upscaler へ置き、以後は使い回す。
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import threading
 from pathlib import Path
@@ -24,6 +25,14 @@ MODEL_URL = (
     "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/"
     "RealESRGAN_x4plus_anime_6B.pth"
 )
+# 落としたファイルの照合値。配布元が公表していないので、独立した 3 つの出所が
+# 一致することを確かめて固定した:
+#   - 上の URL から取り直したもの
+#   - 手元にあったもの（以前この URL から取得したもの）
+#   - Hugging Face の別ミラー (utnah/esrgan) が持つ LFS の sha256
+# いずれも 17,938,799 バイトで同じ値だった。GitHub の API はこの古いリリースに
+# digest を持っていないため、そちらからは取れない。
+MODEL_SHA256 = "f872d837d3c90ed2e05227bed711af5671a6fd1c9f7d7e91c911a61f155e99da"
 
 # 拡大率。モデル自体は 4 倍なので、4 倍に上げてから目的の倍率へ縮める。
 # 一度大きくしてから縮めた方が、直接の倍率で処理するより輪郭がなめらかになる
@@ -66,11 +75,33 @@ def _say(on_phase, text: str) -> None:
         on_phase(text)
 
 
+def _sha256(path: Path) -> str:
+    """ファイルの SHA256。17MB なので一瞬で終わる。"""
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while chunk := f.read(1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _ensure_weights(on_phase=None) -> Path:
-    """モデルファイルを用意する。無ければ落とす。"""
+    """モデルファイルを用意する。無ければ落とす。
+
+    置く前に MODEL_SHA256 と照合する。17MB とはいえ通信は途中で化けうるし、
+    このファイルは pickle 形式なので、素性の確かめられないものを読ませたくない
+    （spandrel が制限付きの unpickler を使うので、それだけで乗っ取られはしない）。
+    """
     path = MODEL_DIR / MODEL_NAME
     if path.exists():
-        return path
+        if _sha256(path) == MODEL_SHA256:
+            return path
+        # 既にあるものが違う。勝手に消さず、消し方を伝えて止める。
+        # 利用者が意図して別のファイルを置いた可能性もある
+        raise UpscalerError(
+            f"拡大用モデルの中身が想定と違います（{MODEL_NAME}）。"
+            "通信の途中で壊れたか、別のファイルに差し替えられています。\n"
+            f"{path} を削除してから、もう一度お試しください（約 17MB を取り直します）。"
+        )
     # 初回だけネットワーク待ちが入る。黙って止まると回線の問題と区別が付かない
     _say(on_phase, "拡大用モデルをダウンロードしています... (初回のみ 約17MB)")
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -90,6 +121,14 @@ def _ensure_weights(on_phase=None) -> Path:
             f"拡大用モデルの取得に失敗しました: {e}\n"
             "ネットワーク接続を確認してください（初回のみ約 17MB の取得が必要です）。"
         ) from e
+    if _sha256(part) != MODEL_SHA256:
+        # 壊れたものは残さない。残すと次回そのまま置かれてしまう
+        part.unlink(missing_ok=True)
+        raise UpscalerError(
+            "拡大用モデルのダウンロードが壊れていました"
+            "（配布元のものと中身が一致しません）。\n"
+            "途中のファイルは削除したので、もう一度お試しください。"
+        )
     part.rename(path)
     return path
 

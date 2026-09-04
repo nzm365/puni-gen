@@ -288,14 +288,118 @@ def _png_meta(params: dict) -> PngImagePlugin.PngInfo:
     return info
 
 
+def meta_from_info(info) -> dict | None:
+    """PIL が持っているテキストチャンクから生成条件を取り出す。
+
+    img2img に置かれた画像はパスではなく PIL の形で渡ってくるので、
+    ファイルを開き直さずにここから読む。
+    """
+    raw = (info or {}).get(META_KEY) or (info or {}).get(LEGACY_META_KEY)
+    try:
+        return json.loads(raw) if raw else None
+    except ValueError:
+        return None
+
+
 def read_meta(path) -> dict | None:
     """PNG から生成条件を読み戻す。無ければ None（古い画像や外部の画像）。"""
     try:
         with Image.open(path) as im:
-            raw = im.info.get(META_KEY) or im.info.get(LEGACY_META_KEY)
-        return json.loads(raw) if raw else None
+            return meta_from_info(im.info)
     except (OSError, ValueError):
         return None
+
+
+def _aspect_for(size) -> str | None:
+    """記録されたサイズに一致するサイズ欄の選択肢。無ければ None。"""
+    if not size or len(size) != 2:
+        return None
+    for label, wh in ASPECTS.items():
+        if wh and list(wh) == list(size):
+            return label
+    return None
+
+
+# 復元で触る欄の数。prefix / prompt / negative / steps / cfg / sampler /
+# clip_skip / seed / aspect の 9 つと、LoRA の (名前, 強度) × MAX、注記 1 つ
+RESTORE_COUNT = 9 + lora.MAX * 2 + 1
+
+
+def split_prefix(meta) -> tuple[str, str]:
+    """記録された prompt を、プレフィックス欄とプロンプト欄に分け直す。
+
+    生成時は (プレフィックス + プロンプト) を連結して 1 本の文字列として
+    記録している。そのまま prompt 欄へ入れるとプレフィックスが二重に付くが、
+    かといってプレフィックス欄を空のままにすると、画面がその絵の作り方を
+    表さない。そこで、その絵を作ったモデルのプリセットからプレフィックスを
+    引き、前方一致したぶんだけプレフィックス欄へ戻す。
+
+    引くのは「いま選ばれているモデル」ではなく「その絵を作ったモデル」の
+    プリセット。実際に連結されたのはそちらだから。
+
+    前方一致しないとき（プリセットを変えた、生成時に手で消した、など）は
+    プレフィックスを空にして全部を prompt 欄へ入れる。連結した結果はどちらでも
+    同じなので、記録どおりに作り直せることは変わらない。
+    """
+    full = meta.get("prompt", "")
+    ckpt = meta.get("ckpt")
+    if not ckpt:
+        return "", full
+    try:
+        prefix = load_preset(ckpt)["prefix_pos"] or ""
+    except (OSError, ValueError, KeyError):
+        return "", full   # プリセットが読めなくても復元自体は続ける
+    if prefix and full.startswith(prefix):
+        return prefix, full[len(prefix):]
+    return "", full
+
+
+def restore_fields(meta):
+    """読み取った生成条件を、左の入力欄へ戻すための更新をまとめて作る。
+
+    履歴からの選択と、img2img への画像設置で同じものを使う。
+    条件が無い画像では 1 つも触らない（gr.skip）。既に打ちかけている
+    プロンプトを、素性の分からない画像で消してしまわないため。
+
+    プレフィックスとプロンプトの分け方は split_prefix を参照。
+    """
+    hold = (gr.skip(),) * RESTORE_COUNT
+    if not meta:
+        return hold
+
+    aspect = _aspect_for(meta.get("size"))
+    choices = lora_choices()
+    raw = [(n, w) for n, w in (meta.get("loras") or [])][:lora.MAX]
+    lora_outs = []
+    for i in range(lora.MAX):
+        if i < len(raw):
+            name, weight = raw[i]
+            # 手元に無い名前も選択肢に足して残す。消すと、元の絵に効いていた
+            # LoRA が抜けたことに気づけない（注記は on_lora_change が出す）
+            c = choices if name in choices else choices + [name]
+            lora_outs.append(gr.update(choices=c, value=name))
+            lora_outs.append(gr.update(value=lora.clamp(weight)))
+        else:
+            lora_outs.append(gr.update(choices=choices, value=LORA_NONE))
+            lora_outs.append(gr.update(value=lora.WEIGHT_DEFAULT))
+    note = on_lora_change(*[
+        x for i in range(lora.MAX)
+        for x in ((raw[i][0], raw[i][1]) if i < len(raw) else (LORA_NONE, 0))
+    ])
+    prefix_val, prompt_val = split_prefix(meta)
+    return (
+        prefix_val,
+        prompt_val,
+        meta.get("negative", ""),
+        meta.get("steps", 28),
+        meta.get("cfg", 5.0),
+        meta.get("sampler", "euler_a"),
+        meta.get("clip_skip", 2),
+        meta.get("seed", -1),
+        gr.update(value=aspect) if aspect else gr.skip(),
+        *lora_outs,
+        note,
+    )
 
 
 def _save_async(images, paths, params: dict | None = None):
@@ -364,7 +468,7 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
                 full_prompt, negative, size[0], size[1],
                 steps, float(cfg), sampler, int(clip_skip), seed, n,
                 image=in_image, strength=float(strength),
-                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                step_cb=lambda s, total: q.put(("step", s, total)),
                 on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
@@ -380,11 +484,8 @@ def on_generate(ckpt, prefix, prompt, negative, aspect, n, steps, cfg, sampler, 
         if msg[0] == "phase":
             yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
             continue
-        _, s, total, imgs = msg
-        if imgs is not None:
-            yield imgs, _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
-        else:
-            yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
+        _, s, total = msg
+        yield gr.update(), _bar(f"生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
@@ -500,6 +601,8 @@ def on_upscale(last, idx):
 # （ui_style.py 側で定義）。ラベル自体は空にしておく。
 FAV_CLASS = "fav-btn"          # 未登録
 FAV_CLASS_DONE = "fav-btn on"  # 登録済み
+# 削除ボタン。ラベルは ui_style.py 側で見えなくし、ゴミ箱の絵に置き換える
+DEL_CLASS = "del-btn"
 
 
 def _fav_name(state, idx) -> str | None:
@@ -524,6 +627,84 @@ def _fav_button(state, idx):
         elem_classes=FAV_CLASS_DONE if on else FAV_CLASS,
         interactive=True,
     )
+
+
+# ---------- 削除（ゴミ箱へ移動）----------
+# 消したものの置き場。outputs/ の中に置くのは、生成物の在り処を 1 つに保つため。
+# list_history() は outputs/ の直下しか見ないので、ここへ移せば履歴から消える。
+TRASH_DIR = OUT_DIR / ".trash"
+
+
+def _to_trash(path: Path) -> Path:
+    """1 枚をゴミ箱へ移し、移した先を返す。
+
+    unlink せず移動にするのは、押し間違いから戻せるようにするため。お気に入りの
+    解除が favorites から outputs へ「戻す」操作なのと同じ考え方で、消す操作も
+    取り返しがつく形にしてある。ゴミ箱の整理は自動ではやらない。
+    """
+    TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    dest = TRASH_DIR / path.name
+    if dest.exists():
+        # 手でゴミ箱から戻したものを、また消したとき。上書きすると先に消した方が
+        # 失われて戻せなくなるので、名前をずらして両方残す
+        dest = TRASH_DIR / f"{path.stem}_{datetime.now():%H%M%S}{path.suffix}"
+    shutil.move(str(path), str(dest))
+    return dest
+
+
+def _forget_cached(name: str) -> None:
+    """消した画像を含む結果キャッシュを捨てる。
+
+    同一設定・同一 seed の再実行はキャッシュを返すだけで保存し直さない。
+    消したあとに同じ条件で生成すると、画面には出るのにファイルが無い、という
+    食い違いが起きてしまう。もう一度計算させれば、ちゃんと保存される。
+    """
+    for key in [
+        k for k, v in RESULT_CACHE.items()
+        if any(Path(p).name == name for p in (v[2] or {}).get("paths", []))
+    ]:
+        del RESULT_CACHE[key]
+
+
+def on_delete(which, last, picked, hist_sel):
+    """選択中の画像をゴミ箱へ移す。
+
+    お気に入りに入っている画像は断る。お気に入りは残すために選り分けた場所で、
+    履歴を片づけるためのボタンで消えてしまうと具合が悪い。★ で解除してもらう。
+
+    「今回の結果」から消したときは、画面のギャラリーからも取り除く。ファイルだけ
+    消えて絵が残っていると、消えたのかどうか分からない。
+    """
+    state = hist_sel if which == "history" else last
+    idx = 0 if which == "history" else picked
+    name = _fav_name(state, idx)
+    if not name:
+        where = "履歴から画像を選んでください。" if which == "history" else "先に画像を生成してください。"
+        return where, gr.skip(), gr.skip(), gr.skip()
+
+    if (FAV_DIR / name).exists():
+        return ("お気に入りに入っている画像は消せません。"
+                "★ を押して解除してから、もう一度お試しください。"), gr.skip(), gr.skip(), gr.skip()
+
+    src = OUT_DIR / name
+    if not src.exists():
+        # 既に消えている（別の窓から消した、手で片づけた）。一覧の更新だけで足りる
+        return "この画像は見つかりませんでした（すでに消えているようです）。", gr.skip(), gr.skip(), gr.skip()
+
+    _to_trash(src)
+    _forget_cached(name)
+    msg = f"{name} をゴミ箱 (outputs/.trash/) へ移しました。戻したいときはフォルダから出してください。"
+
+    if which == "history":
+        # 履歴側は .then(_refresh_hist) が貼り替える。こちらは触らない
+        return msg, gr.skip(), gr.skip(), gr.skip()
+
+    # 「今回の結果」から消した分を、表示と持ち回している状態の両方から抜く
+    i = 0 if picked is None else min(int(picked), len(last["paths"]) - 1)
+    rest = dict(last)
+    for key in ("images", "paths", "seeds"):
+        rest[key] = [x for j, x in enumerate(last.get(key, [])) if j != i]
+    return msg, gr.update(value=rest["images"]), rest, None
 
 
 def list_favorites():
@@ -606,7 +787,7 @@ def on_variations(last, idx):
             res["out"] = engine.variations(
                 last["prompt"], last["negative"], w, h, last["steps"], last["cfg"],
                 last["sampler"], last["clip_skip"], base_seed,
-                preview_cb=lambda s, total, imgs: q.put(("step", s, total, imgs)),
+                step_cb=lambda s, total: q.put(("step", s, total)),
                 on_phase=lambda t: q.put(("phase", t)),
             )
         except Exception as e:  # noqa: BLE001
@@ -621,11 +802,8 @@ def on_variations(last, idx):
         if msg[0] == "phase":
             yield gr.update(), _bar(msg[1]), gr.skip(), gr.skip()
             continue
-        _, s, total, imgs = msg
-        if imgs is not None:
-            yield imgs, _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
-        else:
-            yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
+        _, s, total = msg
+        yield gr.update(), _bar(f"変分を生成中... {s}/{total} step", s / total), gr.skip(), gr.skip()
     if "err" in res:
         e = res["err"]
         raise e if isinstance(e, gr.Error) else gr.Error(str(e))
@@ -660,7 +838,11 @@ def on_variations(last, idx):
 
 # ---------- 生成履歴 ----------
 def list_history():
-    """outputs/ の画像を新しい順に返す。"""
+    """outputs/ の画像を新しい順に返す。
+
+    glob は再帰しないので、ゴミ箱 (outputs/.trash/) の中身はここに出てこない。
+    rglob に変えるとゴミ箱ごと履歴に並んでしまうので、そのままにしておく。
+    """
     if not OUT_DIR.exists():
         return []
     files = sorted(OUT_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -683,9 +865,10 @@ def on_pick_history(evt: gr.SelectData):
     返す辞書は on_variations / on_upscale / on_favorite が受け取る形と同じなので、
     生成タブ用に書いたハンドラをそのまま使い回せる。
     """
+    hold = (gr.skip(),) * RESTORE_COUNT
     files = list_history()
     if evt.index is None or evt.index >= len(files):
-        return None, "選択できませんでした。再読み込みしてください。"
+        return None, "選択できませんでした。再読み込みしてください。", *hold
     path = Path(files[evt.index])
     meta = read_meta(path)
     try:
@@ -693,7 +876,7 @@ def on_pick_history(evt: gr.SelectData):
         img.load()
         img = img.convert("RGB")
     except OSError as e:
-        return None, f"画像を開けませんでした: {e}"
+        return None, f"画像を開けませんでした: {e}", *hold
 
     if meta is None:
         # 生成条件が無い画像（この機能より前に作られたもの、外部から置いたもの）。
@@ -704,10 +887,13 @@ def on_pick_history(evt: gr.SelectData):
             "sampler": "euler_a", "clip_skip": 2, "steps": 28,
             "size": list(img.size), "no_meta": True,
         }
-        return state, (
+        # 素性の分からない画像で、打ちかけの設定を消さないよう欄は触らない
+        return (
+            state,
             f"{path.name}  size: {img.width}x{img.height}\n"
             "生成条件が記録されていない画像です（この機能より前に作られたもの）。\n"
-            "お気に入りには入れられますが、少しだけ変える・解像度を上げるは実行できません。"
+            "お気に入りには入れられますが、少しだけ変える・解像度を上げるは実行できません。",
+            *hold,
         )
 
     state = {
@@ -720,14 +906,31 @@ def on_pick_history(evt: gr.SelectData):
     }
     size = meta.get("size") or list(img.size)
     # 生成直後に出る表示と語順を揃えておくと、見比べたときに読みやすい
-    return state, (
+    return (
+        state,
         f"seed: {meta.get('seed')}  size: {size[0]}x{size[1]}  "
         f"steps: {meta.get('steps')}  cfg: {meta.get('cfg')}  "
         f"{meta.get('sampler')}  clip skip: {meta.get('clip_skip')}\n"
         + (f"{_lora_text(state['loras'])}\n" if state["loras"] else "")
         + f"model: {meta.get('ckpt')}  file: {path.name}\n"
-        f"prompt: {meta.get('prompt', '')}"
+        + f"prompt: {meta.get('prompt', '')}",
+        *restore_fields(meta),
     )
+
+
+def on_image_meta(img):
+    """img2img に置かれた画像から生成条件を読み戻す。
+
+    履歴と同じ経路にしてある。自分で生成した絵をファイルから置き直したときに、
+    条件だけ失われるのを避けるため。
+    """
+    hold = (gr.skip(),) * RESTORE_COUNT
+    if img is None:
+        return (gr.skip(), *hold)
+    meta = meta_from_info(getattr(img, "info", None))
+    if not meta:
+        return (_note("この画像には生成条件が記録されていません（設定は変えません）"), *hold)
+    return (_note("画像に記録されていた生成条件を欄に戻しました"), *restore_fields(meta))
 
 
 def _need_meta(state):
@@ -768,8 +971,8 @@ def begin_job(which, last, picked, hist_sel):
     """押された時点で対象を確定し、先に「今回の結果」へ切り替える。
 
     切り替えはチェーンの最後にあったため、履歴から押すと生成が終わるまで
-    履歴を見たままだった。進捗バーも途中プレビューも右カラムに出るので、
-    待っている間こそそちらを見せたい。だから押した直後に移す。
+    履歴を見たままだった。進捗バーは右カラムに出るので、待っている間こそ
+    そちらを見せたい。だから押した直後に移す。
 
     対象をここで確定して State に持たせるのは、切り替えに伴って which_out が
     current になっても、履歴で選んだ画像を見失わないようにするため。
@@ -841,7 +1044,8 @@ def on_download(cands, idx, progress=gr.Progress()):
     try:
         msg = civitai.download(
             cand,
-            on_progress=lambda frac, text: progress(frac, desc=f"ダウンロード中 {text}"),
+            # 何をしているか（ダウンロード中／確認中）は civitai.py 側が文言ごと渡す
+            on_progress=lambda frac, text: progress(frac, desc=text),
         )
     except civitai.CivitaiError as e:
         return (f"⚠ {e}", *hold)
@@ -948,9 +1152,22 @@ with gr.Blocks(title="PuniGen") as demo:
                         hires = gr.Button(
                             f"解像度を {upscaler.SCALE:g} 倍", variant="secondary", scale=3
                         )
+                        # 消すといっても実体はゴミ箱への移動なので、赤 (stop) にはしない。
+                        # 中止と同じ強さで出すと、取り返しがつかない操作に見えてしまう
+                        # 星と同じくラベルを見せない絵のボタン。scale=0 で伸ばさず、
+                        # 幅は星と同じく CSS の min-width (46px) に任せる。
+                        # min_width をここで渡すとインライン style になり、CSS より
+                        # 強くて効かなくなる（渡して 29px まで潰れた）。
+                        # 既定 (160px) のまま伸ばすと 3 つが幅を等分し、
+                        # 「少しだけ変える（2 枚）」が折り返す（実測 187px 必要）
+                        delete = gr.Button(
+                            "削除", variant="secondary", scale=0,
+                            elem_classes=DEL_CLASS,
+                        )
                         # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
+                        # 星だけのボタンなので伸ばさない。余った幅は左の 2 つに渡す
                         favorite = gr.Button(
-                            "", variant="secondary", scale=1,
+                            "", variant="secondary", scale=0,
                             elem_classes=FAV_CLASS,
                         )
                     info = gr.Textbox(label="生成情報", interactive=False, lines=3,
@@ -1034,6 +1251,12 @@ with gr.Blocks(title="PuniGen") as demo:
     # 画面の並び (名前, 強度) × 3 をそのまま渡す。lora_items がここから畳む
     lora_inputs = [c for pair in zip(lora_dds, lora_sls) for c in pair]
 
+    # 画像から生成条件を戻す先。順番は restore_fields の戻り値と揃える
+    restore_outputs = (
+        [prefix, prompt, negative, steps, cfg, sampler, clip_skip, seed, aspect]
+        + lora_inputs + [lora_note]
+    )
+
     # 選ばれた LoRA が手元にあるか、選び直すたびに確かめて知らせる
     for _dd in lora_dds:
         _dd.change(on_lora_change, lora_inputs, lora_note)
@@ -1087,7 +1310,9 @@ with gr.Blocks(title="PuniGen") as demo:
     out_tabs.select(
         _on_out_tab, None, [hist_gallery, hist_sel, info, which_out],
     ).then(fav_button_state, *_fav_args)
-    hist_gallery.select(on_pick_history, None, [hist_sel, info]).then(
+    hist_gallery.select(
+        on_pick_history, None, [hist_sel, info] + restore_outputs,
+    ).then(
         fav_button_state, *_fav_args
     )
     hist_gallery.preview_close(None, None, None, js=_EXIT_FS)
@@ -1123,6 +1348,18 @@ with gr.Blocks(title="PuniGen") as demo:
         on_favorite_target, [which_out, last_gen, picked, hist_sel],
         [info, fav_gallery],
     ).then(fav_button_state, *_fav_args)
+
+    # 削除はお気に入りと違って一覧から画像が減るので、履歴も貼り替える。
+    # 貼り替えると選択中の番号が別の画像を指してしまうため、
+    # on_refresh_history が選択を外してから星の状態を取り直す。
+    delete.click(
+        on_delete, [which_out, last_gen, picked, hist_sel],
+        [info, gallery, last_gen, picked],
+    ).then(*_refresh_hist).then(fav_button_state, *_fav_args)
+
+    # img2img に置いた画像からも同じ経路で戻す。自分で生成した絵を
+    # ファイルから置き直したときに、条件だけ失われるのを避ける
+    in_image.upload(on_image_meta, in_image, [progress] + restore_outputs)
 
     fav_tab.select(on_refresh_favorites, None, fav_gallery)
     demo.load(on_refresh_favorites, None, fav_gallery)

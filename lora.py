@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from safetensors import safe_open
 
@@ -48,9 +48,30 @@ def list_loras() -> list[str]:
 
 
 def path_of(name: str) -> Path | None:
-    """名前から実ファイルを引く。無ければ None。"""
+    """名前から実ファイルを引く。無ければ None。
+
+    名前が画面の一覧から選ばれるとは限らない。プロンプトに貼られた
+    `<lora:...>` や、画像に埋め込まれた生成条件からも来るので、"../" のように
+    ディレクトリを跨ぐ文字列が混ざりうる。素通しすると models/loras/ の外を
+    指せてしまい、外にあるファイルの有無が「見つかりません」と「読み込めません」の
+    違いから分かってしまう（実際に読めることを確認した）。
+
+    そこで区切りを含む名前は「無い」として扱う。名前を末尾要素へ丸めて
+    通す手もあるが、それだと画面に出ている名前と実際に読むファイルが
+    食い違う。一覧に出す名前 (list_loras) は p.stem なので区切りを含まず、
+    弾いても正規の LoRA を取りこぼすことはない。
+
+    LoRA のパスを組み立てるのはここだけなので、engine 側も含めて
+    この 1 か所で塞がる。
+    """
+    if not name or name != PurePosixPath(str(name).replace("\\", "/")).name:
+        return None
     p = LORA_DIR / f"{name}.safetensors"
-    return p if p.exists() else None
+    # 不正なパス (NUL を含むなど) では exists() が ValueError を投げる版がある
+    try:
+        return p if p.exists() else None
+    except (OSError, ValueError):
+        return None
 
 
 # SDXL 固有の名前。LoRA のキーがどれにも当たらないなら、別の構造のモデル向けに
