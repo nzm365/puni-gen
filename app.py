@@ -574,6 +574,8 @@ def on_upscale(last, idx):
 # （ui_style.py 側で定義）。ラベル自体は空にしておく。
 FAV_CLASS = "fav-btn"          # 未登録
 FAV_CLASS_DONE = "fav-btn on"  # 登録済み
+# 削除ボタン。ラベルは ui_style.py 側で見えなくし、ゴミ箱の絵に置き換える
+DEL_CLASS = "del-btn"
 
 
 def _fav_name(state, idx) -> str | None:
@@ -1125,10 +1127,16 @@ with gr.Blocks(title="PuniGen") as demo:
                         )
                         # 消すといっても実体はゴミ箱への移動なので、赤 (stop) にはしない。
                         # 中止と同じ強さで出すと、取り返しがつかない操作に見えてしまう
-                        # 伸ばさず、文字がちょうど収まる幅で置く。Gradio の既定
-                        # (min_width=160) のままだと 3 つのボタンが幅を等分し、
-                        # 「少しだけ変える（2 枚）」が折り返してしまう（実測 187px 必要）
-                        delete = gr.Button("削除", variant="secondary", scale=0, min_width=64)
+                        # 星と同じくラベルを見せない絵のボタン。scale=0 で伸ばさず、
+                        # 幅は星と同じく CSS の min-width (46px) に任せる。
+                        # min_width をここで渡すとインライン style になり、CSS より
+                        # 強くて効かなくなる（渡して 29px まで潰れた）。
+                        # 既定 (160px) のまま伸ばすと 3 つが幅を等分し、
+                        # 「少しだけ変える（2 枚）」が折り返す（実測 187px 必要）
+                        delete = gr.Button(
+                            "削除", variant="secondary", scale=0,
+                            elem_classes=DEL_CLASS,
+                        )
                         # お気に入り済みかどうかを色で示すので、状態に応じて variant を差し替える
                         # 星だけのボタンなので伸ばさない。余った幅は左の 2 つに渡す
                         favorite = gr.Button(
