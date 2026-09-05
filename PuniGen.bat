@@ -28,7 +28,7 @@ if not errorlevel 1 goto :uv_ok
 echo       見つかりません。ユーザー領域にインストールします（管理者権限は要りません）
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 rem 入れた直後は PATH に反映されていないので、この実行の間だけ足す
-set "PATH=%USERPROFILE%\.localin;%PATH%"
+set "PATH=%USERPROFILE%\.local\bin;%PATH%"
 where uv >nul 2>nul
 if errorlevel 1 goto :uv_missing
 :uv_ok
